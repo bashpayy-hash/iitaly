@@ -6,6 +6,17 @@ const express = require("express");
 const fs = require("fs");
 const app = express();
 // 8 МБ: фото документа в base64 весит 1-6 МБ. Чат и заказы валидируются отдельно по длине.
+// CORS: браузер не пустит запрос с сайта на другой домен без этих заголовков.
+// Разрешаем всем — эндпоинты и так защищены rate limit, а ключ живёт только здесь.
+app.use((req, res, next) => {
+  res.header("Access-Control-Allow-Origin", "*");
+  res.header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  res.header("Access-Control-Allow-Headers", "Content-Type");
+  res.header("Access-Control-Max-Age", "86400");
+  if (req.method === "OPTIONS") return res.sendStatus(204);   // preflight-запрос браузера
+  next();
+});
+
 app.use(express.json({ limit: "8mb" }));
 
 // Ошибки разбора тела отдаём как JSON, а не HTML-страницей
