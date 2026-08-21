@@ -1,0 +1,12 @@
+{
+  "name": "iitaly-backend",
+  "version": "1.0.0",
+  "description": "IItaly — прокси для ИИ-чата, приём заказов, лидов и аналитика",
+  "main": "server.js",
+  "engines": { "node": ">=18" },
+  "scripts": {
+    "start": "node server.js",
+    "smoke": "node smoke-test.js"
+  },
+  "dependencies": { "express": "^4.19.0" }
+}
