@@ -287,7 +287,11 @@ app.post("/api/order", rateLimit, async (req, res) => {
     console.log("ORDER:", line);
     fs.appendFile(__dirname + "/orders.log", line + "\n", () => {});
 
-    const token = process.env.TG_BOT_TOKEN, chat = process.env.TG_CHAT_ID;
+    const token = process.env.TG_BOT_TOKEN, chat = process.env.TG_CHAT_ID; 
+    // --- ДОБАВЬ ЭТИ ДВЕ СТРОКИ ---
+console.log(`[DEBUG] Token type: ${typeof token}, length: ${token ? token.length : 'N/A'}`);
+console.log(`[DEBUG] Chat type: ${typeof chat}, value: '${chat}'`);
+// -----------------------------
     if (token && chat) {
       fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
         method: "POST",
