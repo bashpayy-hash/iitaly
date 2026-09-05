@@ -413,6 +413,28 @@ app.post("/api/portal/:code/notify", rateLimit, (req, res) => {
   res.json({ ok: true, email: c.email || "", tgLinked: !!c.tgChatId, notify: c.notify });
 });
 
+// Клиент безвозвратно удаляет свои данные (профиль, прогресс, историю проверок).
+// Фраза-подтверждение проверяется и на сервере — фронтенд её тоже спрашивает,
+// но полагаться только на клиентскую проверку нельзя.
+app.post("/api/portal/:code/delete", rateLimit, (req, res) => {
+  const code = String(req.params.code || "").toUpperCase().slice(0, 12);
+  const c = readClient(code);
+  if (!c) return res.status(404).json({ ok: false, error: "Не нашли бронь" });
+  if (normSurname(req.body && req.body.surname) !== normSurname(c.surname)) {
+    return res.status(403).json({ ok: false, error: "Нет доступа" });
+  }
+  if ((req.body && req.body.confirm) !== "УДАЛИТЬ") {
+    return res.status(400).json({ ok: false, error: "Подтверждение не совпадает" });
+  }
+  try {
+    fs.unlinkSync(clientPath(code));
+    res.json({ ok: true });
+  } catch (e) {
+    console.error("delete client failed:", e.message);
+    res.status(500).json({ ok: false, error: "Не удалось удалить" });
+  }
+});
+
 /* ---------- Подписка клиента на бота ----------
    Студент открывает ссылку t.me/бот?start=КОД, жмёт Start —
    Telegram шлёт сюда апдейт, и мы привязываем его чат к кабинету. */
