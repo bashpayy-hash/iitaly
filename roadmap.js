@@ -81,7 +81,7 @@ const STAGES = [
       { id: "test", t: "Записаться и сдать вступительный тест (TOLC / IMAT / внутренний)", dl: "testReg" },
       { id: "uniApply", t: "Подать заявку в выбранные вузы", dl: "uniApply" },
       { id: "universitaly", t: "Заполнить pre-enrolment на Universitaly", dl: "universitaly", warn: "Без него визу не дадут" },
-      { id: "checkpoint1", t: "Экспертная проверка перед подачей", expert: true, dl: "uniApply" },
+      { id: "checkpoint1", t: "Финальная сверка пакета перед подачей", ai: true, dl: "uniApply", note: "Система сверит комплект. Нестандартный случай можно отдать эксперту — отдельная услуга" },
     ],
   },
   {
@@ -93,7 +93,7 @@ const STAGES = [
       { id: "familyDocs", t: "Собрать справки семьи за референсный год", dl: "familyDocs", warn: "Для приёма 2026/27 — доходы за 2024, счета на 31.12.2024" },
       { id: "iseeu", t: "Оформить ISEEU parificato через CAF", dl: "iseeu" },
       { id: "dsuApply", t: "Подать заявку в региональное агентство", dl: "discoDsu", note: "DiSCo — июль, ER.GO — август, Toscana — сентябрь" },
-      { id: "checkpoint2", t: "Экспертная проверка пакета DSU", expert: true, dl: "iseeu" },
+      { id: "checkpoint2", t: "Сверка пакета DSU перед подачей", ai: true, dl: "iseeu", warn: "Здесь цена ошибки — год. Если сомневаешься, отдай пакет на проверку человеку" },
     ],
   },
   {
@@ -107,7 +107,7 @@ const STAGES = [
       { id: "housing", t: "Подтвердить жильё", dl: "visaSubmit" },
       { id: "blsSlot", t: "Записаться в BLS", dl: "blsSlot", warn: "Лимит 30 студенческих заявок в день" },
       { id: "visaSubmit", t: "Подать документы на визу", dl: "visaSubmit", warn: "Не позднее 15 дней до выезда" },
-      { id: "checkpoint3", t: "Экспертная проверка визового досье", expert: true, dl: "blsSlot" },
+      { id: "checkpoint3", t: "Сверка визового досье", ai: true, dl: "blsSlot" },
     ],
   },
   {
