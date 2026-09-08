@@ -44,7 +44,6 @@ const STAGES = [
   {
     id: "start",
     title: "Старт и профиль",
-    tiers: ["Lite", "Standard", "Flagship"],
     tasks: [
       { id: "profile", t: "Заполнить профиль: класс, оценки, бюджет, город мечты", ai: true },
       { id: "shortlist", t: "Получить персональный shortlist программ", ai: true, dl: "chooseUni" },
@@ -54,7 +53,6 @@ const STAGES = [
   {
     id: "education12",
     title: "Требование 12 лет образования",
-    tiers: ["Lite", "Standard", "Flagship"],
     skipIf: (p) => p.education === "НИШ / 12 лет" || p.education === "Бакалавр" || p.goal === "Магистратура",
     tasks: [
       { id: "path12", t: "Выбрать путь: год вуза в КЗ или foundation year", ai: true },
@@ -64,7 +62,6 @@ const STAGES = [
   {
     id: "docs",
     title: "Документы и признание",
-    tiers: ["Lite", "Standard", "Flagship"],
     tasks: [
       { id: "apostille", t: "Проставить апостиль на аттестат или диплом", dl: "apostille", warn: "Апостиль только на оригинал и только ДО перевода" },
       { id: "translate", t: "Присяжный перевод на итальянский", dl: "apostille" },
@@ -76,7 +73,6 @@ const STAGES = [
   {
     id: "apply",
     title: "Подача в университет",
-    tiers: ["Standard", "Flagship"],
     tasks: [
       { id: "test", t: "Записаться и сдать вступительный тест (TOLC / IMAT / внутренний)", dl: "testReg" },
       { id: "uniApply", t: "Подать заявку в выбранные вузы", dl: "uniApply" },
@@ -87,7 +83,6 @@ const STAGES = [
   {
     id: "dsu",
     title: "Стипендия DSU",
-    tiers: ["Flagship"],
     skipIf: (p) => p.budget === "Без ограничений",
     tasks: [
       { id: "familyDocs", t: "Собрать справки семьи за референсный год", dl: "familyDocs", warn: "Для приёма 2026/27 — доходы за 2024, счета на 31.12.2024" },
@@ -99,7 +94,6 @@ const STAGES = [
   {
     id: "visa",
     title: "Виза D",
-    tiers: ["Standard", "Flagship"],
     tasks: [
       { id: "money", t: "Обеспечить финансовую гарантию на счёте", dl: "money", note: "€6 947,33 за каждый год обучения" },
       { id: "statements", t: "Получить банковские выписки за 3 месяца с QR", dl: "blsSlot" },
@@ -113,7 +107,6 @@ const STAGES = [
   {
     id: "arrival",
     title: "Первые дни в Италии",
-    tiers: ["Standard", "Flagship"],
     tasks: [
       { id: "kit", t: "Kit giallo на почте", dl: "permesso", warn: "В первые 8 рабочих дней после въезда" },
       { id: "codice", t: "Получить codice fiscale", dl: "permesso" },
@@ -130,12 +123,13 @@ function daysLeft(iso) {
   return Math.round((d - today) / 86400000);
 }
 
-function buildRoadmap(tier, profile, intakeYear) {
+function buildRoadmap(_tier, profile, intakeYear) {
   const p = profile || {};
   const year = intakeYear || defaultIntakeYear();
   const out = [];
   for (const st of STAGES) {
-    if (!st.tiers.includes(tier)) continue;
+    // Тарифов больше нет: продукт один, маршрут полный для всех.
+    // Скрываются только этапы, которые конкретному человеку не нужны.
     if (st.skipIf && st.skipIf(p)) continue;
     out.push({
       id: st.id,
