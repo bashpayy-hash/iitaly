@@ -45,6 +45,11 @@ const app = express();
 // CORS: без этих заголовков браузер не пустит запрос ни с сайта на Netlify,
 // ни со страницы выдачи доступа, открытой локально (там origin = "null").
 app.use((req, res, next) => {
+  // базовые заголовки: браузер не угадывает тип файла, не отдаёт реферер,
+  // страница не встраивается в чужой iframe
+  res.header("X-Content-Type-Options", "nosniff");
+  res.header("Referrer-Policy", "strict-origin-when-cross-origin");
+  res.header("X-Frame-Options", "DENY");
   res.header("Access-Control-Allow-Origin", "*");
   res.header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
   res.header("Access-Control-Allow-Headers", "Content-Type");
@@ -81,15 +86,68 @@ try {
   try { fs.mkdirSync(STORE_DIR + "/clients", { recursive: true }); } catch (e2) {}
   console.warn("WARN: постоянный том недоступен, кабинеты хранятся временно в " + STORE_DIR);
 }
-const clientPath = (code) => STORE_DIR + "/clients/" + code + ".json";
+/* Код доступа попадает в имя файла, поэтому проверяем его строго по белому
+   списку символов. Без этой проверки через код вида "../../ETC/X" можно
+   вырваться из папки с данными и прочитать или перезаписать чужой файл. */
+const CODE_RE = /^[A-Z0-9-]{4,12}$/;
+const validCode = (code) => CODE_RE.test(code) && !code.includes("..");
+const clientPath = (code) => {
+  if (!validCode(code)) throw new Error("bad code");
+  return STORE_DIR + "/clients/" + code + ".json";
+};
+
+/* ---------- Шифрование данных клиентов ----------
+   Файлы кабинетов содержат имя, телефон и почту. На диске держим их
+   зашифрованными: если кто-то получит доступ к тому, без ключа это мусор.
+
+   Ключ — переменная DATA_KEY (любая длинная строка). Из неё выводится
+   ключ шифрования, поэтому саму строку менять нельзя: старые файлы
+   перестанут читаться. Если DATA_KEY не задан, работаем без шифрования
+   и предупреждаем в логах — чтобы запуск не падал молча. */
+const crypto = require("crypto");
+const DATA_KEY = process.env.DATA_KEY || "";
+const encKey = DATA_KEY
+  ? crypto.createHash("sha256").update(String(DATA_KEY)).digest()
+  : null;
+
+function encrypt(text) {
+  const iv = crypto.randomBytes(12);
+  const c = crypto.createCipheriv("aes-256-gcm", encKey, iv);
+  const enc = Buffer.concat([c.update(text, "utf8"), c.final()]);
+  // формат: v1.вектор.тег.данные — версия нужна, чтобы позже сменить алгоритм
+  return "v1." + iv.toString("base64") + "." + c.getAuthTag().toString("base64")
+       + "." + enc.toString("base64");
+}
+function decrypt(raw) {
+  const p = raw.split(".");
+  if (p.length !== 4 || p[0] !== "v1") throw new Error("bad format");
+  const d = crypto.createDecipheriv("aes-256-gcm", encKey, Buffer.from(p[1], "base64"));
+  d.setAuthTag(Buffer.from(p[2], "base64"));
+  return Buffer.concat([d.update(Buffer.from(p[3], "base64")), d.final()]).toString("utf8");
+}
 
 function readClient(code) {
-  try { return JSON.parse(fs.readFileSync(clientPath(code), "utf8")); }
-  catch (e) { return null; }
+  if (!validCode(code)) return null;
+  try {
+    const raw = fs.readFileSync(clientPath(code), "utf8");
+    // старые файлы лежат открытым текстом — читаем и их, чтобы не потерять клиентов
+    if (raw.startsWith("v1.")) {
+      if (!encKey) { console.error("Файл зашифрован, а DATA_KEY не задан"); return null; }
+      return JSON.parse(decrypt(raw));
+    }
+    return JSON.parse(raw);
+  } catch (e) {
+    console.error("read client failed:", e.message);
+    return null;
+  }
 }
 function writeClient(code, data) {
-  try { fs.writeFileSync(clientPath(code), JSON.stringify(data, null, 2)); return true; }
-  catch (e) { console.error("write client failed:", e.message); return false; }
+  if (!validCode(code)) return false;
+  try {
+    const json = JSON.stringify(data, null, 2);
+    fs.writeFileSync(clientPath(code), encKey ? encrypt(json) : json);
+    return true;
+  } catch (e) { console.error("write client failed:", e.message); return false; }
 }
 // Код доступа: без похожих символов, чтобы диктовать по телефону
 function makeCode() {
@@ -114,6 +172,19 @@ if (!API_KEY) console.warn("WARN: ANTHROPIC_API_KEY не задан — чат �
 // --- Простейший rate limit: 20 запросов / 5 минут с одного IP ---
 const hits = new Map();
 const WINDOW_MS = 5 * 60 * 1000, MAX_HITS = 20;
+
+/* Запрос с ограничением по времени: если внешний сервис не отвечает,
+   соединение обрывается, а не копится до исчерпания памяти. */
+async function fetchWithTimeout(url, opts, ms = 60000) {
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), ms);
+  try {
+    return await fetch(url, Object.assign({}, opts, { signal: ctrl.signal }));
+  } finally {
+    clearTimeout(t);
+  }
+}
+
 function rateLimit(req, res, next) {
   const ip = req.headers["x-forwarded-for"]?.split(",")[0] || req.ip;
   const now = Date.now();
@@ -159,7 +230,7 @@ app.post("/api/chat", rateLimit, async (req, res) => {
       }
     }
 
-    const r = await fetch("https://api.anthropic.com/v1/messages", {
+    const r = await fetchWithTimeout("https://api.anthropic.com/v1/messages", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -241,7 +312,7 @@ app.post("/api/check-document", rateLimit, async (req, res) => {
       return res.status(400).json({ ok: false, error: "Пришли фото, PDF или файл документа." });
     }
 
-    const r = await fetch("https://api.anthropic.com/v1/messages", {
+    const r = await fetchWithTimeout("https://api.anthropic.com/v1/messages", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -290,11 +361,9 @@ app.post("/api/portal/create", async (req, res) => {
     const key = process.env.STATS_KEY;
     if (!key || req.body.key !== key) return res.status(403).json({ ok: false, error: "forbidden" });
 
-    const { name, surname, phone, email, tier, profile, intakeYear } = req.body || {};
-    const TIERS = ["Lite", "Standard", "Flagship"];
+    const { name, surname, phone, email, profile, intakeYear } = req.body || {};
     if (typeof name !== "string" || name.trim().length < 2) return res.status(400).json({ ok: false, error: "Укажи имя" });
     if (typeof surname !== "string" || surname.trim().length < 2) return res.status(400).json({ ok: false, error: "Укажи фамилию" });
-    if (!TIERS.includes(tier)) return res.status(400).json({ ok: false, error: "Тариф: Lite, Standard или Flagship" });
 
     let code = makeCode();
     for (let i = 0; i < 5 && readClient(code); i++) code = makeCode();
@@ -307,7 +376,6 @@ app.post("/api/portal/create", async (req, res) => {
       email: typeof email === "string" && /.+@.+\..+/.test(email) ? email.trim().slice(0, 80) : "",
       tgChatId: null,          // заполнится, когда клиент нажмёт Start у бота
       notify: { email: true, telegram: true },
-      tier,
       profile: profile && typeof profile === "object" ? profile : {},
       intakeYear: Number.isInteger(intakeYear) && intakeYear > 2024 && intakeYear < 2100
         ? intakeYear : defaultIntakeYear(),
@@ -317,12 +385,12 @@ app.post("/api/portal/create", async (req, res) => {
     };
     if (!writeClient(code, data)) return res.status(500).json({ ok: false, error: "Не удалось сохранить" });
 
-    console.log("PORTAL CREATED: " + code + " | " + tier + " | " + data.surname + " " + data.name);
+    console.log("PORTAL CREATED: " + code);   // без имени: логи хранит хостинг
     const token = process.env.TG_BOT_TOKEN, chat = process.env.TG_CHAT_ID;
     if (token && chat) {
       fetch("https://api.telegram.org/bot" + token + "/sendMessage", {
         method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ chat_id: chat, text: "\u{1F511} Кабинет создан\n" + data.surname + " " + data.name + " · " + tier + "\nКод: " + code }),
+        body: JSON.stringify({ chat_id: chat, text: "\u{1F511} Кабинет создан\n" + data.surname + " " + data.name + "\nКод: " + code }),
       }).catch(() => {});
     }
     res.json({ ok: true, code });
@@ -346,20 +414,21 @@ app.get("/api/portal/:code", rateLimit, (req, res) => {
   if (!c) return deny();
   if (normSurname(req.query.surname) !== normSurname(c.surname)) return deny();
 
-  const roadmap = buildRoadmap(c.tier, c.profile, c.intakeYear);
+  const roadmap = buildRoadmap(null, c.profile, c.intakeYear);
   let total = 0, done = 0;
   for (const st of roadmap) for (const t of st.tasks) { total++; if (c.done[t.id]) done++; }
 
   res.json({
     ok: true,
     client: {
-      name: c.name, surname: c.surname, tier: c.tier, intakeYear: c.intakeYear, createdAt: c.createdAt,
+      name: c.name, surname: c.surname, intakeYear: c.intakeYear, createdAt: c.createdAt,
       email: c.email || "", tgLinked: !!c.tgChatId,
       notify: c.notify || { email: true, telegram: true },
       botName: process.env.TG_BOT_NAME || "",
     },
     roadmap,
     done: c.done,
+    docs: c.docs || {},
     progress: { done, total, pct: total ? Math.round((done / total) * 100) : 0 },
   });
 });
@@ -381,7 +450,7 @@ app.post("/api/portal/:code/task", rateLimit, (req, res) => {
   c.updatedAt = new Date().toISOString();
   if (!writeClient(code, c)) return res.status(500).json({ ok: false, error: "Не удалось сохранить" });
 
-  const roadmap = buildRoadmap(c.tier, c.profile, c.intakeYear);
+  const roadmap = buildRoadmap(null, c.profile, c.intakeYear);
   let total = 0, done = 0;
   for (const st of roadmap) for (const t of st.tasks) { total++; if (c.done[t.id]) done++; }
   res.json({ ok: true, done: c.done, progress: { done, total, pct: total ? Math.round((done / total) * 100) : 0 } });
@@ -389,6 +458,86 @@ app.post("/api/portal/:code/task", rateLimit, (req, res) => {
 
 
 
+
+
+/* Проверка документа, привязанная к задаче маршрута.
+   Файл не храним — только вердикт и сводку, этого достаточно для досье
+   и не создаёт хранилища персональных документов. */
+app.post("/api/portal/:code/doc", rateLimit, (req, res) => {
+  const code = String(req.params.code || "").toUpperCase().slice(0, 12);
+  const c = readClient(code);
+  if (!c) return res.status(404).json({ ok: false, error: "Не нашли бронь" });
+  if (normSurname(req.body && req.body.surname) !== normSurname(c.surname)) {
+    return res.status(403).json({ ok: false, error: "Нет доступа" });
+  }
+  const { task, result, fileName } = req.body || {};
+  if (typeof task !== "string" || !/^[a-zA-Z0-9_]{2,30}$/.test(task)) {
+    return res.status(400).json({ ok: false, error: "Некорректная задача" });
+  }
+  if (!result || typeof result !== "object") {
+    return res.status(400).json({ ok: false, error: "Нет результата проверки" });
+  }
+
+  const VERDICTS = ["ok", "warn", "error", "unreadable"];
+  const verdict = VERDICTS.includes(result.verdict) ? result.verdict : "warn";
+  const problems = Array.isArray(result.problems) ? result.problems.length : 0;
+  const critical = Array.isArray(result.problems)
+    ? result.problems.filter((p) => p && p.severity === "critical").length : 0;
+
+  c.docs = c.docs || {};
+  const prev = c.docs[task];
+  c.docs[task] = {
+    verdict,
+    docTitle: String(result.docTitle || "Документ").slice(0, 80),
+    summary: String(result.summary || "").slice(0, 400),
+    problems, critical,
+    fileName: typeof fileName === "string" ? fileName.slice(0, 80) : "",
+    checkedAt: new Date().toISOString(),
+    attempts: (prev && prev.attempts ? prev.attempts : 0) + 1,
+  };
+
+  // документ без критических ошибок закрывает шаг сам
+  if (verdict === "ok") c.done[task] = new Date().toISOString();
+  else if (critical > 0) delete c.done[task];
+
+  c.updatedAt = new Date().toISOString();
+  if (!writeClient(code, c)) return res.status(500).json({ ok: false, error: "Не удалось сохранить" });
+
+  const roadmap = buildRoadmap(null, c.profile, c.intakeYear);
+  let total = 0, done = 0;
+  for (const st of roadmap) for (const t of st.tasks) { total++; if (c.done[t.id]) done++; }
+  res.json({ ok: true, docs: c.docs, done: c.done,
+    progress: { done, total, pct: total ? Math.round((done / total) * 100) : 0 } });
+});
+
+
+/* Удаление данных по запросу. В политике конфиденциальности мы это обещаем,
+   значит должен быть работающий способ, а не переписка вручную. */
+app.post("/api/portal/:code/delete", rateLimit, (req, res) => {
+  const code = String(req.params.code || "").toUpperCase().slice(0, 12);
+  const c = readClient(code);
+  if (!c) return res.status(404).json({ ok: false, error: "Не нашли бронь" });
+  if (normSurname(req.body && req.body.surname) !== normSurname(c.surname)) {
+    return res.status(403).json({ ok: false, error: "Нет доступа" });
+  }
+  if (req.body.confirm !== "УДАЛИТЬ") {
+    return res.status(400).json({ ok: false, error: "Нужно подтверждение" });
+  }
+  try {
+    fs.unlinkSync(clientPath(code));
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: "Не удалось удалить" });
+  }
+  console.log("PORTAL DELETED: " + code);
+  const token = process.env.TG_BOT_TOKEN, chat = process.env.TG_CHAT_ID;
+  if (token && chat) {
+    fetchWithTimeout("https://api.telegram.org/bot" + token + "/sendMessage", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ chat_id: chat, text: "\u{1F5D1} Клиент удалил свои данные: " + code }),
+    }, 15000).catch(() => {});
+  }
+  res.json({ ok: true });
+});
 
 // Клиент управляет напоминаниями из кабинета
 app.post("/api/portal/:code/notify", rateLimit, (req, res) => {
@@ -413,28 +562,6 @@ app.post("/api/portal/:code/notify", rateLimit, (req, res) => {
   res.json({ ok: true, email: c.email || "", tgLinked: !!c.tgChatId, notify: c.notify });
 });
 
-// Клиент безвозвратно удаляет свои данные (профиль, прогресс, историю проверок).
-// Фраза-подтверждение проверяется и на сервере — фронтенд её тоже спрашивает,
-// но полагаться только на клиентскую проверку нельзя.
-app.post("/api/portal/:code/delete", rateLimit, (req, res) => {
-  const code = String(req.params.code || "").toUpperCase().slice(0, 12);
-  const c = readClient(code);
-  if (!c) return res.status(404).json({ ok: false, error: "Не нашли бронь" });
-  if (normSurname(req.body && req.body.surname) !== normSurname(c.surname)) {
-    return res.status(403).json({ ok: false, error: "Нет доступа" });
-  }
-  if ((req.body && req.body.confirm) !== "УДАЛИТЬ") {
-    return res.status(400).json({ ok: false, error: "Подтверждение не совпадает" });
-  }
-  try {
-    fs.unlinkSync(clientPath(code));
-    res.json({ ok: true });
-  } catch (e) {
-    console.error("delete client failed:", e.message);
-    res.status(500).json({ ok: false, error: "Не удалось удалить" });
-  }
-});
-
 /* ---------- Подписка клиента на бота ----------
    Студент открывает ссылку t.me/бот?start=КОД, жмёт Start —
    Telegram шлёт сюда апдейт, и мы привязываем его чат к кабинету. */
@@ -448,6 +575,26 @@ app.post("/api/tg/webhook", async (req, res) => {
     if (!msg || !msg.chat || !msg.text) return;
     const chatId = msg.chat.id;
     const text = String(msg.text).trim();
+
+    // отписка: обещали команду — она должна работать
+    if (/^\/stop\b/i.test(text)) {
+      const files = listClients();
+      let off = 0;
+      for (const f of files) {
+        const cl = readClient(f.replace(/\.json$/, ""));
+        if (cl && cl.tgChatId === chatId) {
+          cl.tgChatId = null;
+          cl.notify = cl.notify || {};
+          cl.notify.telegram = false;
+          writeClient(cl.code, cl);
+          off++;
+        }
+      }
+      await tgSendTo(chatId, off
+        ? "Напоминания в Telegram отключены. Включить обратно можно в кабинете на сайте."
+        : "Этот чат не привязан к кабинету — отключать нечего.");
+      return;
+    }
 
     const m = text.match(/^\/start\s+([A-Z0-9-]{4,12})$/i);
     if (!m) {
@@ -466,9 +613,10 @@ app.post("/api/tg/webhook", async (req, res) => {
     c.notify.telegram = true;
     writeClient(code, c);
 
-    await tgSendTo(chatId, "Готово, " + c.name + "! Напоминания включены.\n"
-      + "Буду писать за 30, 14, 7, 3 и 1 день до каждого дедлайна.\n"
-      + "Чтобы отключить, отправь /stop");
+    await tgSendTo(chatId, "Готово, " + c.name + "! Напоминания включены.\n\n"
+      + "По понедельникам буду присылать сводку по ближайшим шагам, "
+      + "а если до дедлайна останется 7, 3 или 1 день — напишу отдельно.\n\n"
+      + "Отключить: /stop");
     console.log("TG SUBSCRIBED: " + code + " → chat " + chatId);
   } catch (e) {
     console.error("tg webhook error:", e.message);
@@ -483,7 +631,11 @@ app.post("/api/tg/webhook/stop", (_req, res) => res.json({ ok: true }));
    за 30, 14, 7, 3 и 1 день до срока, плюс один раз при просрочке.
    Каждое напоминание уходит ровно один раз: отметка пишется в файл клиента. */
 
-const REMIND_AT = [30, 14, 7, 3, 1];
+/* Срочные пороги: только то, что реально горит. Всё остальное уходит
+   в еженедельную сводку — иначе за сезон человек получит десятки сообщений. */
+const URGENT_AT = [7, 3, 1];
+const DIGEST_DAY = 1;          // понедельник
+const DIGEST_HORIZON = 45;     // о чём напоминаем в сводке
 
 function listClients() {
   try { return fs.readdirSync(STORE_DIR + "/clients").filter((f) => f.endsWith(".json")); }
@@ -494,7 +646,7 @@ async function tgSendTo(chatId, text) {
   const token = process.env.TG_BOT_TOKEN;
   if (!token || !chatId) return false;
   try {
-    const r = await fetch("https://api.telegram.org/bot" + token + "/sendMessage", {
+    const r = await fetchWithTimeout("https://api.telegram.org/bot" + token + "/sendMessage", {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ chat_id: chatId, text }),
     });
@@ -506,7 +658,7 @@ async function tgSend(text) {
   const token = process.env.TG_BOT_TOKEN, chat = process.env.TG_CHAT_ID;
   if (!token || !chat) return false;
   try {
-    const r = await fetch("https://api.telegram.org/bot" + token + "/sendMessage", {
+    const r = await fetchWithTimeout("https://api.telegram.org/bot" + token + "/sendMessage", {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ chat_id: chat, text }),
     });
@@ -518,15 +670,17 @@ async function runReminders() {
   const files = listClients();
   if (!files.length) return { checked: 0, sent: 0 };
   let sent = 0;
+  const isDigestDay = new Date().getDay() === DIGEST_DAY;
 
   for (const f of files) {
     const code = f.replace(/\.json$/, "");
     const c = readClient(code);
     if (!c) continue;
 
-    const roadmap = buildRoadmap(c.tier, c.profile, c.intakeYear);
+    const roadmap = buildRoadmap(null, c.profile, c.intakeYear);
     c.reminded = c.reminded || {};
     const due = [];
+    const digest = [];
     const keys = [];   // отметки ставим ТОЛЬКО после успешной отправки
 
     for (const st of roadmap) {
@@ -539,26 +693,39 @@ async function runReminders() {
           if (!c.reminded[key]) { due.push({ t, kind: "over" }); keys.push(key); }
           continue;
         }
-        // порог: берём наибольший непройденный
-        const mark = REMIND_AT.find((d) => t.daysLeft <= d && !c.reminded[t.id + ":" + d]);
+        // срочное: до срока неделя или меньше
+        const mark = URGENT_AT.find((d) => t.daysLeft <= d && !c.reminded[t.id + ":" + d]);
         if (mark !== undefined) {
           due.push({ t, kind: "soon", mark });
           keys.push(t.id + ":" + mark);
+          continue;
         }
+        // остальное копим для еженедельной сводки
+        if (isDigestDay && t.daysLeft <= DIGEST_HORIZON) digest.push(t);
       }
     }
 
-    if (!due.length) continue;
+    // сводка уходит не чаще раза в неделю
+    const weekKey = "digest:" + new Date().toISOString().slice(0, 10);
+    const sendDigest = isDigestDay && digest.length && !c.reminded[weekKey];
+    if (!due.length && !sendDigest) continue;
 
-    const lines = due.slice(0, 6).map((x) =>
+    let lines = due.slice(0, 6).map((x) =>
       (x.kind === "over"
         ? "\u{26A0} просрочено на " + (-x.t.daysLeft) + " дн"
         : "\u{23F0} через " + x.t.daysLeft + " дн") + " — " + x.t.t);
-    const tail = due.length > 6 ? "\n… и ещё " + (due.length - 6) : "";
+    let tail = due.length > 6 ? "\n… и ещё " + (due.length - 6) : "";
+
+    if (sendDigest) {
+      digest.sort((a, b) => a.daysLeft - b.daysLeft);
+      const dl = digest.slice(0, 5).map((t) => "\u{2022} через " + t.daysLeft + " дн — " + t.t);
+      lines = lines.concat(lines.length ? ["", "Ближайшие полтора месяца:"] : ["Ближайшие полтора месяца:"], dl);
+      if (digest.length > 5) tail = "\n… и ещё " + (digest.length - 5) + " шагов в кабинете";
+      keys.push(weekKey);
+    }
 
     // --- владельцу: сводка с кодом кабинета ---
-    const ownerText = "Напоминание по клиенту\n" + c.surname + " " + c.name + " · " + c.tier
-      + " · код " + code + "\n\n" + lines.join("\n") + tail;
+    const ownerText = "Напоминание по клиенту\n" + c.surname + " " + c.name + " · код " + code + "\n\n" + lines.join("\n") + tail;
     const okOwner = await tgSend(ownerText);
 
     // --- клиенту: то же, но своим языком ---
@@ -575,7 +742,10 @@ async function runReminders() {
       const subj = due.some((x) => x.kind === "over")
         ? "IItaly: есть просроченные шаги"
         : "IItaly: скоро дедлайн по поступлению";
-      const okMail = await sendMail(c.email, subj, clientText);
+      const mailText = clientText
+        + "\n\n———\nОтключить письма: зайди в кабинет → Помощь → Напоминания, "
+        + "или ответь на это письмо словом «отписка».";
+      const okMail = await sendMail(c.email, subj, mailText);
       okClient = okClient || okMail;
     }
 
@@ -698,7 +868,7 @@ app.post("/api/order", rateLimit, async (req, res) => {
       return res.status(400).json({ ok: false, error: "Проверь имя и телефон." });
     }
     const line = `${new Date().toISOString()} | ${product} | ${price || "?"} ₸ | ${name} | ${phone}`;
-    console.log("ORDER:", line);
+    console.log("ORDER:", product, price + " ₸");   // имя и телефон только в Telegram, не в логах
     fs.appendFile(__dirname + "/orders.log", line + "\n", () => {});
 
     const token = process.env.TG_BOT_TOKEN, chat = process.env.TG_CHAT_ID;
@@ -720,4 +890,39 @@ app.post("/api/order", rateLimit, async (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
+/* Проверка настроек при старте: лучше увидеть предупреждение в логах,
+   чем обнаружить неработающую функцию через неделю. */
+(function checkEnv(){
+  const need = {
+    ANTHROPIC_API_KEY: "ИИ-чат и проверка документов",
+    STATS_KEY: "выдача доступа и статистика",
+    TG_BOT_TOKEN: "уведомления о заказах",
+    TG_CHAT_ID: "уведомления о заказах",
+  };
+  const opt = {
+    TG_BOT_NAME: "кнопка подключения бота в кабинете",
+    SITE_URL: "ссылки в письмах и сообщениях",
+    SMTP_HOST: "письма с напоминаниями",
+  };
+  const miss = Object.keys(need).filter((k) => !process.env[k]);
+  const missOpt = Object.keys(opt).filter((k) => !process.env[k]);
+  if (miss.length) {
+    console.warn("НЕ РАБОТАЕТ без настройки:");
+    for (const k of miss) console.warn("  " + k + " → " + need[k]);
+  }
+  if (missOpt.length) {
+    console.log("Отключено (необязательно): " + missOpt.map((k) => k + " → " + opt[k]).join("; "));
+  }
+  if (STORE_DIR !== DATA_DIR) {
+    console.warn("ВНИМАНИЕ: тома нет, данные клиентов сотрутся при следующем деплое");
+  }
+  if (!process.env.DATA_KEY) {
+    console.warn("DATA_KEY не задан — данные клиентов лежат открытым текстом. "
+      + "Задай длинную случайную строку и НЕ МЕНЯЙ её: при смене старые файлы не прочитаются.");
+  } else {
+    console.log("Данные клиентов шифруются");
+  }
+  if (!miss.length) console.log("Настройки в порядке");
+})();
+
 app.listen(PORT, () => console.log(`IItaly proxy up on :${PORT}`));
