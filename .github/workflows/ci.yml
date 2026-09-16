@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+
+      - run: npm ci
+
+      - name: Синтаксис
+        run: node --check server.js && node --check roadmap.js && node --check smoke-test.js
+
+      # Поднимаем сервер без ключа Anthropic: чат ответит 502, и это
+      # ожидаемый результат — smoke-test знает про оба варианта. Ключ в
+      # CI не нужен, а платить за прогон тестов токенами не за что.
+      # DATA_DIR во временную папку: тома здесь нет, а без переменной
+      # сервер попытается писать в /data и упадёт в предупреждение.
+      - name: Поднять сервер и прогнать smoke-test
+        env:
+          STATS_KEY: ci-test-key
+          REMINDERS: "off"
+          PORT: "3000"
+        run: |
+          export DATA_DIR="$RUNNER_TEMP/iitaly-data"
+          node server.js & echo $! > /tmp/server.pid
+          for i in $(seq 1 30); do
+            curl -sf http://localhost:3000/health >/dev/null && break
+            sleep 1
+          done
+          STATS_KEY=ci-test-key node smoke-test.js
+          status=$?
+          kill "$(cat /tmp/server.pid)" || true
+          exit $status

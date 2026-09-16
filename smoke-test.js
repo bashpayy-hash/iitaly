@@ -66,6 +66,35 @@ async function j(method, path, body) {
   r = await j("GET", "/api/stats?key=" + KEY);
   ok(r.status === 200 && Array.isArray(r.data?.funnel), "GET /api/stats?key=… → 200 воронка");
 
+  // 12. кабинет: новый POST-вход отвечает и не пускает по выдуманному коду
+  r = await j("POST", "/api/portal/lookup", { code: "AAAA-AAAA", surname: "Несуществующий" });
+  ok(r.status === 404 && r.data?.ok === false, "POST /api/portal/lookup неверный код → 404");
+
+  // 13. кабинет: старый GET оставлен рабочим ради раздельного деплоя фронта и бэка
+  r = await j("GET", "/api/portal/AAAA-AAAA?surname=Несуществующий");
+  ok(r.status === 404 && r.data?.ok === false, "GET /api/portal/:code (старый путь) → 404");
+
+  // 14. кабинет: выход за пределы папки с данными через код доступа
+  r = await j("POST", "/api/portal/lookup", { code: "../../etc", surname: "x" });
+  ok(r.status === 404, "POST /api/portal/lookup обход каталога → 404");
+
+  /* 15. Цены в промпте совпадают с ценами на сайте.
+     Проверка статическая и стоит здесь не случайно: расхождение уже
+     случалось — промпт называл 27 000 ₸, пока витрина показывала
+     25 000 ₸, и это заметили не тесты, а разбор кода. Цифры внизу
+     дублируют src/data/pricing.ts во фронтенд-репозитории; меняются
+     оба места одним заходом. */
+  const prompt = require("fs").readFileSync(__dirname + "/system-prompt.txt", "utf8");
+  ok(prompt.includes("25 000 \u20b8"), "промпт называет цену 25 000 ₸");
+  ok(!prompt.includes("27 000 \u20b8"), "в промпте нет старой цены 27 000 ₸");
+  ok(prompt.includes("16 900 \u20b8"), "промпт называет срочную проверку 16 900 ₸");
+  // Границу слева проверяем вручную: «16 900 ₸» содержит в себе «6 900 ₸»,
+  // и наивный includes() ронял тест на разрешённой цене.
+  const ghosts = ["6 900", "8 900", "9 900", "12 900", "20 900", "28 900", "39 900"];
+  const found = ghosts.filter((g) => new RegExp("(^|[^0-9])" + g + "\\s*\u20b8").test(prompt));
+  ok(found.length === 0, "промпт не продаёт услуг, которых нет на сайте"
+    + (found.length ? " — нашлись: " + found.join(", ") : ""));
+
   console.log("\n" + (fail === 0 ? "ВСЁ ПРОШЛО" : fail + " ПРОВАЛОВ") + " — pass: " + pass + ", fail: " + fail);
   process.exit(fail === 0 ? 0 : 1);
 })();
