@@ -385,6 +385,17 @@ app.post("/api/chat", rateLimit, async (req, res) => {
 const ALLOWED_MEDIA = ["image/jpeg", "image/png", "image/webp", "image/gif"];
 const MAX_B64 = 7_500_000;   // ~5.6 МБ файла — предел Anthropic API
 
+/* Потолок ответа проверки. Был 1500 — на глаз впритык: типовой разбор
+   (пять проверок, две проблемы, три шага) по-русски занимает около 600
+   токенов, но кириллица в токенизаторе дороже латиницы, а на сложном
+   документе модели разрешено семь проверок вместо пяти, и запас в
+   2.5 раза съедается быстро. Обрезанный ответ не разбирается ничем:
+   JSON.parse падает, а запасной поиск /\{[\s\S]*\}/ требует закрывающей
+   скобки, которой у обрезанного ответа нет. Платим только за
+   сгенерированное, поэтому запас ничего не стоит, а обрыв стоит всей
+   проверки. */
+const ANSWER_TOKENS = 4000;
+
 app.post("/api/check-document", heavyLimit, async (req, res) => {
   try {
     if (!CHECK_PROMPT) return res.status(503).json({ ok: false, error: "Проверка документов временно недоступна." });
@@ -435,7 +446,7 @@ app.post("/api/check-document", heavyLimit, async (req, res) => {
       },
       body: JSON.stringify({
         model: MODEL,
-        max_tokens: 1500,
+        max_tokens: ANSWER_TOKENS,
         system: CHECK_PROMPT,
         messages: [{ role: "user", content }],
       }),
@@ -447,7 +458,8 @@ app.post("/api/check-document", heavyLimit, async (req, res) => {
     }
 
     const data = await r.json();
-    const raw = (data.content || []).filter((b) => b.type === "text").map((b) => b.text).join("\n").trim();
+    const blocks = Array.isArray(data.content) ? data.content : [];
+    const raw = blocks.filter((b) => b.type === "text").map((b) => b.text).join("\n").trim();
     const cleaned = raw.replace(/^```(?:json)?/i, "").replace(/```$/, "").trim();
     let parsed = null;
     try {
@@ -457,7 +469,41 @@ app.post("/api/check-document", heavyLimit, async (req, res) => {
       if (m) { try { parsed = JSON.parse(m[0]); } catch {} }
     }
     if (!parsed) {
-      console.error("check-document: не удалось разобрать ответ модели");
+      /* Диагностика формы ответа — БЕЗ единого символа самого ответа.
+         Раньше здесь была одна строка «не удалось разобрать ответ
+         модели», и по ней нельзя было отличить обрезанный ответ от
+         отказа модели и от пустого content: три разные беды выглядели
+         одинаково, и починить их было нечем.
+
+         Содержимое не логируем сознательно. Текст модели пересказывает
+         документ человека — там фамилия, суммы, номер счёта. Сайт обещает
+         «не публикуем и не продаём», и писать это в логи хостинга значит
+         нарушить обещание ради удобства отладки. Формы хватает: причина
+         читается по stop_reason, длине и наличию скобок. */
+      console.error("check-document: ответ модели не разобран " + JSON.stringify({
+        stop_reason: data.stop_reason || "?",
+        output_tokens: (data.usage && data.usage.output_tokens) || 0,
+        max_tokens: ANSWER_TOKENS,
+        blocks: blocks.map((b) => b.type).join("|") || "нет",
+        len: cleaned.length,
+        open: cleaned.includes("{"),
+        close: cleaned.trimEnd().endsWith("}"),
+      }));
+
+      /* Причины разные — и человеку про них надо говорить по-разному.
+         Общее «не удалось разобрать» не подсказывает ни одного действия. */
+      if (data.stop_reason === "max_tokens") {
+        return res.status(502).json({ ok: false,
+          error: "Разбор документа не поместился в ответ. Пришли страницы по отдельности." });
+      }
+      if (data.stop_reason === "refusal") {
+        return res.status(502).json({ ok: false,
+          error: "Проверка отклонила этот файл. Попробуй другой документ или спроси в чате." });
+      }
+      if (!cleaned.length) {
+        return res.status(502).json({ ok: false,
+          error: "Сервис проверки вернул пустой ответ. Попробуй ещё раз через минуту." });
+      }
       return res.status(502).json({ ok: false, error: "Не удалось разобрать результат проверки. Попробуй ещё раз." });
     }
     res.json({ ok: true, result: parsed });
