@@ -109,48 +109,6 @@ async function appendSummary(summary) {
   persistedCount += 1;
 }
 
-
-async function renameTelegramBotOnce() {
-  const token = process.env.TG_BOT_TOKEN || '';
-  const renameId = process.env.TG_BOT_RENAME_ID || '';
-  if (!token || !renameId) return;
-
-  const marker = join(DATA_DIR, 'tg-rename-' + createHmac('sha256', APP_SECRET || 'rename')
-    .update(renameId).digest('hex').slice(0, 20));
-  try {
-    await readFile(marker, 'utf8');
-    console.log('Telegram bot rename: already applied');
-    return;
-  } catch (error) {
-    if (error?.code !== 'ENOENT') throw error;
-  }
-
-  const api = 'https://api.telegram.org/bot' + token;
-  const calls = [
-    ['setMyName', { name: 'IITALY — Напоминания' }],
-    ['setMyShortDescription', { short_description: 'Напоминания о дедлайнах поступления в Италию.' }],
-    ['setMyDescription', { description: 'IITALY напоминает о важных дедлайнах твоего маршрута поступления: за 7, 3 и 1 день, а также присылает еженедельную сводку.' }],
-  ];
-
-  for (const [method, body] of calls) {
-    const response = await fetch(api + '/' + method, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-    });
-    const data = await response.json().catch(() => null);
-    if (!response.ok || !data?.ok) {
-      console.log('Telegram bot rename: failed at ' + method);
-      return;
-    }
-  }
-
-  const handle = await open(marker, 'wx', 0o600);
-  try { await handle.writeFile(new Date().toISOString(), 'utf8'); await handle.sync(); }
-  finally { await handle.close(); }
-  console.log('Telegram bot rename: applied');
-}
-
 async function initialiseStorage() {
   await mkdir(DATA_DIR, { recursive: true, mode: 0o700 });
   const existing = await readFile(EVENTS_FILE, 'utf8').catch(error => {
@@ -221,8 +179,7 @@ app.post(
 );
 
 initialiseStorage()
-  .then(async () => {
-    await renameTelegramBotOnce();
+  .then(() => {
     app.listen(PORT, () => {
       console.log(`IITALY WhatsApp staging webhook listening on :${PORT}; persisted=${persistedCount}`);
     });
