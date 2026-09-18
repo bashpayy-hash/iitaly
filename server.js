@@ -5,6 +5,8 @@
 const express = require("express");
 const fs = require("fs");
 const { buildRoadmap, defaultIntakeYear } = require("./roadmap");
+const { createReminderRunner, RETRY_MS } = require("./reminders");
+const { sendTelegramReminder } = require("./reminder-telegram");
 
 /* ---------- Почта ----------
    Настраивается переменными SMTP_HOST, SMTP_USER, SMTP_PASS, SMTP_FROM.
@@ -30,13 +32,15 @@ if (process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS) {
 async function sendMail(to, subject, text) {
   if (!mailer || !to) return false;
   try {
-    await mailer.sendMail({
+    const info = await mailer.sendMail({
       from: process.env.SMTP_FROM || ("IItaly <" + process.env.SMTP_USER + ">"),
       to, subject, text,
     });
-    return true;
+    // SMTP acceptance for THIS recipient, not just a resolved promise.
+    return Array.isArray(info.accepted) && info.accepted.some(address =>
+      String(typeof address === "string" ? address : address.address).toLowerCase() === to.toLowerCase());
   } catch (e) {
-    console.error("mail failed:", e.message);
+    console.error("mail failed");
     return false;
   }
 }
@@ -814,15 +818,9 @@ app.post("/api/tg/webhook", async (req, res) => {
 app.post("/api/tg/webhook/stop", (_req, res) => res.json({ ok: true }));
 
 /* ================= НАПОМИНАНИЯ О ДЕДЛАЙНАХ =================
-   Раз в сутки проходим по кабинетам и шлём напоминание владельцу в Telegram
-   за 30, 14, 7, 3 и 1 день до срока, плюс один раз при просрочке.
-   Каждое напоминание уходит ровно один раз: отметка пишется в файл клиента. */
-
-/* Срочные пороги: только то, что реально горит. Всё остальное уходит
-   в еженедельную сводку — иначе за сезон человек получит десятки сообщений. */
-const URGENT_AT = [7, 3, 1];
-const DIGEST_DAY = 1;          // понедельник
-const DIGEST_HORIZON = 45;     // о чём напоминаем в сводке
+   Сводка в понедельник и срочные пороги 7/3/1 день. Статус каждого
+   получателя хранится отдельно; удачная отправка владельцу не закрывает
+   неудачную попытку студенту. Логика и изолированные тесты — reminders.js. */
 
 function listClients() {
   try { return fs.readdirSync(STORE_DIR + "/clients").filter((f) => f.endsWith(".json")); }
@@ -841,129 +839,69 @@ async function tgSendTo(chatId, text) {
   } catch (e) { return false; }
 }
 
-async function tgSend(text) {
-  const token = process.env.TG_BOT_TOKEN, chat = process.env.TG_CHAT_ID;
-  if (!token || !chat) return false;
+// Receipt updates must not truncate an existing client file if a write fails.
+// Same encrypted format, same volume; rename only after the temporary write.
+function writeReminderClient(code, data) {
+  if (!validCode(code)) return false;
+  const destination = clientPath(code);
+  const temporary = destination + ".reminder-" + crypto.randomBytes(8).toString("hex") + ".tmp";
   try {
-    const r = await fetchWithTimeout("https://api.telegram.org/bot" + token + "/sendMessage", {
-      method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ chat_id: chat, text }),
-    });
-    return r.ok;
-  } catch (e) { return false; }
-}
-
-async function runReminders() {
-  const files = listClients();
-  if (!files.length) return { checked: 0, sent: 0 };
-  let sent = 0;
-  const isDigestDay = new Date().getDay() === DIGEST_DAY;
-
-  for (const f of files) {
-    const code = f.replace(/\.json$/, "");
-    const c = readClient(code);
-    if (!c) continue;
-
-    const roadmap = buildRoadmap(null, c.profile, c.intakeYear);
-    c.reminded = c.reminded || {};
-    const due = [];
-    const digest = [];
-    const keys = [];   // отметки ставим ТОЛЬКО после успешной отправки
-
-    for (const st of roadmap) {
-      for (const t of st.tasks) {
-        if (c.done[t.id] || t.daysLeft === null) continue;
-
-        // просрочка: напоминаем один раз
-        if (t.daysLeft < 0) {
-          const key = t.id + ":over";
-          if (!c.reminded[key]) { due.push({ t, kind: "over" }); keys.push(key); }
-          continue;
-        }
-        // срочное: до срока неделя или меньше
-        const mark = URGENT_AT.find((d) => t.daysLeft <= d && !c.reminded[t.id + ":" + d]);
-        if (mark !== undefined) {
-          due.push({ t, kind: "soon", mark });
-          keys.push(t.id + ":" + mark);
-          continue;
-        }
-        // остальное копим для еженедельной сводки
-        if (isDigestDay && t.daysLeft <= DIGEST_HORIZON) digest.push(t);
-      }
-    }
-
-    // сводка уходит не чаще раза в неделю
-    const weekKey = "digest:" + new Date().toISOString().slice(0, 10);
-    const sendDigest = isDigestDay && digest.length && !c.reminded[weekKey];
-    if (!due.length && !sendDigest) continue;
-
-    let lines = due.slice(0, 6).map((x) =>
-      (x.kind === "over"
-        ? "\u{26A0} просрочено на " + (-x.t.daysLeft) + " дн"
-        : "\u{23F0} через " + x.t.daysLeft + " дн") + " — " + x.t.t);
-    let tail = due.length > 6 ? "\n… и ещё " + (due.length - 6) : "";
-
-    if (sendDigest) {
-      digest.sort((a, b) => a.daysLeft - b.daysLeft);
-      const dl = digest.slice(0, 5).map((t) => "\u{2022} через " + t.daysLeft + " дн — " + t.t);
-      lines = lines.concat(lines.length ? ["", "Ближайшие полтора месяца:"] : ["Ближайшие полтора месяца:"], dl);
-      if (digest.length > 5) tail = "\n… и ещё " + (digest.length - 5) + " шагов в кабинете";
-      keys.push(weekKey);
-    }
-
-    // --- владельцу: сводка с кодом кабинета ---
-    const ownerText = "Напоминание по клиенту\n" + c.surname + " " + c.name + " · код " + code + "\n\n" + lines.join("\n") + tail;
-    const okOwner = await tgSend(ownerText);
-
-    // --- клиенту: то же, но своим языком ---
-    const clientText = "Привет, " + c.name + "! Напоминание по твоему поступлению:\n\n"
-      + lines.join("\n") + tail
-      + "\n\nОткрыть кабинет: " + (process.env.SITE_URL || "https://iitaly.netlify.app")
-      + "/#portal — фамилия и код " + code;
-
-    let okClient = false;
-    if (c.notify && c.notify.telegram !== false && c.tgChatId) {
-      okClient = await tgSendTo(c.tgChatId, clientText);
-    }
-    if (c.notify && c.notify.email !== false && c.email) {
-      const subj = due.some((x) => x.kind === "over")
-        ? "IItaly: есть просроченные шаги"
-        : "IItaly: скоро дедлайн по поступлению";
-      const mailText = clientText
-        + "\n\n———\nОтключить письма: зайди в кабинет → Помощь → Напоминания, "
-        + "или ответь на это письмо словом «отписка».";
-      const okMail = await sendMail(c.email, subj, mailText);
-      okClient = okClient || okMail;
-    }
-
-    // отметки ставим, только если сообщение реально ушло хоть куда-то
-    if (okOwner || okClient) {
-      const now = new Date().toISOString();
-      for (const k of keys) c.reminded[k] = now;
-      writeClient(code, c);
-      sent++;
-    } else {
-      console.warn("REMINDERS: не отправлено для " + code + ", повторим позже");
-    }
+    const json = JSON.stringify(data, null, 2);
+    fs.writeFileSync(temporary, encKey ? encrypt(json) : json, { mode: 0o600, flag: "wx" });
+    fs.renameSync(temporary, destination);
+    return true;
+  } catch {
+    try { fs.unlinkSync(temporary); } catch { /* best effort */ }
+    console.warn("REMINDERS: receipt write failed");
+    return false;
   }
-  console.log("REMINDERS: кабинетов " + files.length + ", отправлено " + sent);
-  return { checked: files.length, sent };
 }
 
-// Проверяем раз в сутки. Первый прогон через минуту после старта,
-// чтобы перезапуск сервера не рассылал всё разом.
-const DAY_MS = 24 * 60 * 60 * 1000;
+const runReminders = createReminderRunner({
+  listCodes: () => listClients().map(file => file.replace(/\.json$/, "")),
+  readClient,
+  writeClient: writeReminderClient,
+  buildRoadmap: client => buildRoadmap(null, client.profile, client.intakeYear),
+  siteUrl: process.env.SITE_URL || "https://iitaly.netlify.app",
+  channelsFor: client => ({
+    telegram: {
+      enabled: Boolean(process.env.TG_BOT_TOKEN && client.tgChatId && client.notify && client.notify.telegram !== false),
+      target: client.tgChatId,
+      transport: "telegram",
+      send: text => sendTelegramReminder(process.env.TG_BOT_TOKEN, client.tgChatId, text),
+    },
+    email: {
+      enabled: Boolean(mailer && client.email && client.notify && client.notify.email !== false),
+      target: client.email,
+      transport: "email",
+      send: async (text, subject) => ({ ok: await sendMail(client.email, subject, text) }),
+    },
+    owner: {
+      enabled: Boolean(process.env.TG_BOT_TOKEN && process.env.TG_CHAT_ID),
+      target: process.env.TG_CHAT_ID,
+      transport: "telegram",
+      send: text => sendTelegramReminder(process.env.TG_BOT_TOKEN, process.env.TG_CHAT_ID, text),
+    },
+  }),
+});
+
+// A lightweight tick retries failed channels; receipts prevent repeat sends.
+// Existing opt-out switch and legacy replay suppression are preserved.
 if (process.env.REMINDERS !== "off") {
-  setTimeout(() => { runReminders().catch(() => {}); }, 60 * 1000);
-  setInterval(() => { runReminders().catch(() => {}); }, DAY_MS);
+  setTimeout(() => { runReminders().catch(() => console.warn("REMINDERS: tick failed")); }, 60 * 1000);
+  setInterval(() => { runReminders().catch(() => console.warn("REMINDERS: tick failed")); }, RETRY_MS);
 }
 
-// Ручной запуск для проверки: /api/reminders/run?key=STATS_KEY
+// Existing authenticated manual endpoint; uses the same single-flight runner.
 app.get("/api/reminders/run", async (req, res) => {
   const key = process.env.STATS_KEY;
   if (!key || req.query.key !== key) return res.status(403).json({ ok: false, error: "forbidden" });
-  const r = await runReminders();
-  res.json({ ok: true, ...r });
+  try {
+    const result = await runReminders();
+    res.json({ ok: true, ...result });
+  } catch {
+    res.status(500).json({ ok: false, error: "Не удалось проверить напоминания" });
+  }
 });
 
 // --- Аналитика: приём событий ---
