@@ -111,6 +111,69 @@ async function appendSummary(summary) {
 
 
 
+
+async function setupTelegramE2EOnce() {
+  const setupId = process.env.TG_E2E_SETUP_ID || '';
+  const statsKey = process.env.STATS_KEY || '';
+  const backendUrl = (process.env.BACKEND_URL || '').replace(/\/$/, '');
+  const token = process.env.TG_BOT_TOKEN || '';
+  const ownerChat = process.env.TG_CHAT_ID || '';
+  const botName = (process.env.TG_BOT_NAME || '').replace(/^@/, '');
+  if (!setupId || !statsKey || !backendUrl || !token || !ownerChat || !botName) return;
+
+  const marker = join(DATA_DIR, 'tg-e2e-' + createHmac('sha256', APP_SECRET || 'probe').update(setupId).digest('hex').slice(0, 20) + '.json');
+  try {
+    await readFile(marker, 'utf8');
+    console.log('Telegram E2E setup: already prepared');
+    return;
+  } catch (error) {
+    if (error?.code !== 'ENOENT') throw error;
+  }
+
+  const response = await fetch(backendUrl + '/api/portal/create', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      key: statsKey,
+      name: 'Telegram Test',
+      surname: 'IITALY',
+      phone: '',
+      email: '',
+      profile: { education: '11 классов', goal: 'Бакалавриат', budget: 'Без стипендии будет сложно' },
+      intakeYear: 2026,
+    }),
+  });
+  const data = await response.json().catch(() => null);
+  if (!response.ok || !data?.ok || typeof data.code !== 'string') {
+    console.log('Telegram E2E setup: portal creation failed');
+    return;
+  }
+
+  const link = 'https://t.me/' + botName + '?start=' + encodeURIComponent(data.code);
+  const sent = await fetch('https://api.telegram.org/bot' + token + '/sendMessage', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      chat_id: ownerChat,
+      text: 'IITALY Telegram E2E: открой эту ссылку и нажми Start. Это тестовый кабинет, после проверки он будет удалён.\n\n' + link,
+    }),
+  });
+  const sentBody = await sent.json().catch(() => null);
+  if (!sent.ok || !sentBody?.ok) {
+    console.log('Telegram E2E setup: link send failed');
+    return;
+  }
+
+  const handle = await open(marker, 'wx', 0o600);
+  try {
+    await handle.writeFile(JSON.stringify({ code: data.code, surname: 'IITALY' }), 'utf8');
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+  console.log('Telegram E2E setup: test cabinet created and link sent');
+}
+
 async function sendTelegramProbeOnce() {
   const probeId = process.env.TG_STAGING_PROBE_ID || '';
   const token = process.env.TG_BOT_TOKEN || '';
@@ -252,6 +315,7 @@ initialiseStorage()
   .then(async () => {
     await auditTelegram();
     await sendTelegramProbeOnce();
+    await setupTelegramE2EOnce();
     app.listen(PORT, () => {
       console.log(`IITALY WhatsApp staging webhook listening on :${PORT}; persisted=${persistedCount}`);
     });
