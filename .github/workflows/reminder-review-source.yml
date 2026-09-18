@@ -1,0 +1,21 @@
+name: Reminder review source
+on:
+  push:
+    branches: [fix/per-channel-deadline-reminders]
+    paths: [.github/workflows/reminder-review-source.yml]
+permissions:
+  contents: read
+jobs:
+  source:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - run: git archive --format=tar.gz --output=/tmp/reminder-source.tar.gz HEAD
+      - uses: actions/upload-artifact@v4
+        with:
+          name: reminder-source
+          path: /tmp/reminder-source.tar.gz
+          retention-days: 3
