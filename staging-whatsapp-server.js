@@ -56,3 +56,5 @@ app.post('/api/whatsapp/webhook',
 app.listen(PORT, () => {
   console.log(`IITALY WhatsApp staging webhook listening on :${PORT}`);
 });
+
+// Deployment trigger for isolated Railway staging service.
