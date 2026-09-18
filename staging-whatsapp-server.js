@@ -112,6 +112,43 @@ async function appendSummary(summary) {
 
 
 
+
+async function runTelegramE2ERemindersOnce() {
+  const runId = process.env.TG_E2E_RUN_ID || '';
+  const statsKey = process.env.STATS_KEY || '';
+  const backendUrl = (process.env.BACKEND_URL || '').replace(/\/$/, '');
+  if (!runId || !statsKey || !backendUrl) return;
+  const marker = join(DATA_DIR, 'tg-e2e-run-' + createHmac('sha256', APP_SECRET || 'probe').update(runId).digest('hex').slice(0, 20));
+  try {
+    await readFile(marker, 'utf8');
+    console.log('Telegram E2E reminder run: already completed');
+    return;
+  } catch (error) {
+    if (error?.code !== 'ENOENT') throw error;
+  }
+
+  const response = await fetch(backendUrl + '/api/reminders/run?key=' + encodeURIComponent(statsKey));
+  const data = await response.json().catch(() => null);
+  if (!response.ok || !data?.ok) {
+    console.log('Telegram E2E reminder run: failed');
+    return;
+  }
+  const handle = await open(marker, 'wx', 0o600);
+  try {
+    await handle.writeFile(new Date().toISOString(), 'utf8');
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+  console.log('Telegram E2E reminder run: ' + JSON.stringify({
+    checked: data.checked,
+    sent: data.sent,
+    accepted: data.accepted,
+    failed: data.failed,
+    storageErrors: data.storageErrors,
+  }));
+}
+
 async function setupTelegramE2EOnce() {
   const setupId = process.env.TG_E2E_SETUP_ID || '';
   const statsKey = process.env.STATS_KEY || '';
@@ -316,6 +353,7 @@ initialiseStorage()
     await auditTelegram();
     await sendTelegramProbeOnce();
     await setupTelegramE2EOnce();
+    await runTelegramE2ERemindersOnce();
     app.listen(PORT, () => {
       console.log(`IITALY WhatsApp staging webhook listening on :${PORT}; persisted=${persistedCount}`);
     });
