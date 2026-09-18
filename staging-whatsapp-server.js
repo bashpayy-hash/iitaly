@@ -109,6 +109,43 @@ async function appendSummary(summary) {
   persistedCount += 1;
 }
 
+
+async function auditTelegram() {
+  const token = process.env.TG_BOT_TOKEN;
+  if (!token) {
+    console.log('Telegram staging audit: bot token not configured');
+    return;
+  }
+  const api = 'https://api.telegram.org/bot' + token;
+  try {
+    const [meRes, whRes] = await Promise.all([
+      fetch(api + '/getMe'),
+      fetch(api + '/getWebhookInfo'),
+    ]);
+    const me = await meRes.json();
+    const wh = await whRes.json();
+    const rawUrl = wh?.result?.url || '';
+    let webhook = '';
+    try {
+      const u = new URL(rawUrl);
+      webhook = u.hostname + u.pathname;
+    } catch {}
+    console.log('Telegram staging audit: ' + JSON.stringify({
+      reachable: Boolean(meRes.ok && whRes.ok && me?.ok && wh?.ok),
+      username: me?.result?.username || null,
+      displayName: me?.result?.first_name || null,
+      webhook,
+      pendingUpdates: Number.isInteger(wh?.result?.pending_update_count) ? wh.result.pending_update_count : null,
+      lastErrorDate: wh?.result?.last_error_date || null,
+      lastErrorMessage: wh?.result?.last_error_message || null,
+      allowedUpdates: Array.isArray(wh?.result?.allowed_updates) ? wh.result.allowed_updates : [],
+      webhookSecretConfiguredOnRailway: Boolean(process.env.TG_WEBHOOK_SECRET),
+    }));
+  } catch {
+    console.log('Telegram staging audit: API unreachable');
+  }
+}
+
 async function initialiseStorage() {
   await mkdir(DATA_DIR, { recursive: true, mode: 0o700 });
   const existing = await readFile(EVENTS_FILE, 'utf8').catch(error => {
@@ -179,7 +216,8 @@ app.post(
 );
 
 initialiseStorage()
-  .then(() => {
+  .then(async () => {
+    await auditTelegram();
     app.listen(PORT, () => {
       console.log(`IITALY WhatsApp staging webhook listening on :${PORT}; persisted=${persistedCount}`);
     });
