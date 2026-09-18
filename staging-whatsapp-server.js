@@ -113,6 +113,70 @@ async function appendSummary(summary) {
 
 
 
+
+async function verifyStopAndCleanupTelegramE2EOnce() {
+  const cleanupId = process.env.TG_E2E_CLEANUP_ID || '';
+  const backendUrl = (process.env.BACKEND_URL || '').replace(/\/$/, '');
+  if (!cleanupId || !backendUrl) return;
+
+  const doneMarker = join(DATA_DIR, 'tg-e2e-cleanup-' + createHmac('sha256', APP_SECRET || 'probe').update(cleanupId).digest('hex').slice(0, 20));
+  try {
+    await readFile(doneMarker, 'utf8');
+    console.log('Telegram E2E cleanup: already completed');
+    return;
+  } catch (error) {
+    if (error?.code !== 'ENOENT') throw error;
+  }
+
+  const setupMarkerName = 'tg-e2e-' + createHmac('sha256', APP_SECRET || 'probe')
+    .update(process.env.TG_E2E_SETUP_ID || '').digest('hex').slice(0, 20) + '.json';
+  let setup;
+  try {
+    setup = JSON.parse(await readFile(join(DATA_DIR, setupMarkerName), 'utf8'));
+  } catch {
+    console.log('Telegram E2E cleanup: setup marker unavailable');
+    return;
+  }
+  if (!setup?.code || !setup?.surname) return;
+
+  const lookup = await fetch(backendUrl + '/api/portal/lookup', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ code: setup.code, surname: setup.surname }),
+  });
+  const lookupBody = await lookup.json().catch(() => null);
+  const tgLinked = Boolean(lookupBody?.data?.client?.tgLinked ?? lookupBody?.client?.tgLinked);
+  const notifyTelegram = Boolean(
+    (lookupBody?.data?.client?.notify?.telegram ?? lookupBody?.client?.notify?.telegram) !== false
+  );
+  console.log('Telegram E2E stop verification: ' + JSON.stringify({
+    lookupOk: Boolean(lookup.ok && lookupBody?.ok),
+    tgChatIdPresent: tgLinked,
+    notifyTelegramEnabled: notifyTelegram,
+  }));
+
+  if (!lookup.ok || !lookupBody?.ok || tgLinked || notifyTelegram) {
+    console.log('Telegram E2E cleanup: stop state not verified; refusing delete');
+    return;
+  }
+
+  const del = await fetch(backendUrl + '/api/portal/' + encodeURIComponent(setup.code) + '/delete', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ surname: setup.surname, confirm: 'УДАЛИТЬ' }),
+  });
+  const delBody = await del.json().catch(() => null);
+  if (!del.ok || !delBody?.ok) {
+    console.log('Telegram E2E cleanup: delete failed');
+    return;
+  }
+
+  const handle = await open(doneMarker, 'wx', 0o600);
+  try { await handle.writeFile(new Date().toISOString(), 'utf8'); await handle.sync(); }
+  finally { await handle.close(); }
+  console.log('Telegram E2E cleanup: stop verified and test cabinet deleted');
+}
+
 async function runTelegramE2ERemindersOnce() {
   const runId = process.env.TG_E2E_RUN_ID || '';
   const statsKey = process.env.STATS_KEY || '';
@@ -354,6 +418,7 @@ initialiseStorage()
     await sendTelegramProbeOnce();
     await setupTelegramE2EOnce();
     await runTelegramE2ERemindersOnce();
+    await verifyStopAndCleanupTelegramE2EOnce();
     app.listen(PORT, () => {
       console.log(`IITALY WhatsApp staging webhook listening on :${PORT}; persisted=${persistedCount}`);
     });
