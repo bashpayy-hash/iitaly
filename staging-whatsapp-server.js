@@ -9,6 +9,8 @@ const app = express();
 const PORT = Number(process.env.PORT || 3000);
 const VERIFY_TOKEN = process.env.WHATSAPP_WEBHOOK_VERIFY_TOKEN || '';
 const APP_SECRET = process.env.WHATSAPP_APP_SECRET || '';
+const WABA_ID = process.env.WHATSAPP_BUSINESS_ACCOUNT_ID || '';
+const PHONE_NUMBER_ID = process.env.WHATSAPP_PHONE_NUMBER_ID || '';
 const DATA_DIR = process.env.WHATSAPP_STAGING_DATA_DIR || '/data';
 const EVENTS_FILE = join(DATA_DIR, 'whatsapp-webhook-events.jsonl');
 const MAX_BYTES = 256 * 1024;
@@ -33,6 +35,18 @@ function commandKind(message) {
   if (/^(STOP|СТОП|ОТПИСАТЬСЯ|ОТКЛЮЧИТЬ|UNSUBSCRIBE|IITALY_STOP)$/iu.test(normalized)) return 'opt_out';
   if (/^IITALY LINK [a-f0-9]{64}$/iu.test(normalized)) return 'link';
   return null;
+}
+
+function matchesConfiguredAccount(payload) {
+  if (payload?.object !== 'whatsapp_business_account' || !Array.isArray(payload.entry)) return false;
+  return payload.entry.some(entry =>
+    String(entry?.id || '') === WABA_ID &&
+    Array.isArray(entry?.changes) &&
+    entry.changes.some(change =>
+      change?.field === 'messages' &&
+      String(change?.value?.metadata?.phone_number_id || '') === PHONE_NUMBER_ID
+    )
+  );
 }
 
 function summarizeWebhook(payload) {
@@ -109,6 +123,7 @@ app.get('/health', (_req, res) => {
     ok: true,
     service: 'iitaly-whatsapp-staging',
     storage: { ready: true, persistedEvents: persistedCount },
+    accountFilter: { configured: Boolean(WABA_ID && PHONE_NUMBER_ID) },
   });
 });
 
@@ -143,6 +158,12 @@ app.post(
       payload = JSON.parse(req.body.toString('utf8'));
     } catch {
       return res.status(400).end();
+    }
+
+    if (!WABA_ID || !PHONE_NUMBER_ID) return res.status(503).end();
+    if (!matchesConfiguredAccount(payload)) {
+      console.log('WhatsApp staging webhook: signed event ignored (different WABA/phone)');
+      return res.status(204).end();
     }
 
     try {
