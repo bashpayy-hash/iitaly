@@ -1,0 +1,32 @@
+[
+  {
+    "name": "iitaly_deadline_ru",
+    "language": "ru",
+    "category": "UTILITY",
+    "components": [
+      { "type": "BODY", "text": "IITALY: напоминание по вашему сохранённому плану поступления. Задача: {{1}}. Срок: {{2}}. До срока осталось: {{3}}. Если задача уже выполнена, отметьте её в личном кабинете.", "example": { "body_text": [["Подать заявку в университет", "25 сентября 2026, 12:00, Europe/Rome", "7 дней"]] } },
+      { "type": "FOOTER", "text": "Отключить напоминания: ответьте СТОП." },
+      { "type": "BUTTONS", "buttons": [{ "type": "URL", "text": "Открыть план", "url": "https://iitaly.netlify.app/portal" }] }
+    ]
+  },
+  {
+    "name": "iitaly_overdue_ru",
+    "language": "ru",
+    "category": "UTILITY",
+    "components": [
+      { "type": "BODY", "text": "IITALY: в вашем сохранённом плане осталась незавершённая задача: {{1}}. Указанный срок: {{2}}. После срока прошло: {{3}}. Проверьте статус задачи и актуальные условия подачи в кабинете.", "example": { "body_text": [["Загрузить документы", "17 сентября 2026, 12:00, Europe/Rome", "1 день"]] } },
+      { "type": "FOOTER", "text": "Отключить напоминания: ответьте СТОП." },
+      { "type": "BUTTONS", "buttons": [{ "type": "URL", "text": "Открыть план", "url": "https://iitaly.netlify.app/portal" }] }
+    ]
+  },
+  {
+    "name": "iitaly_digest_ru",
+    "language": "ru",
+    "category": "UTILITY",
+    "components": [
+      { "type": "BODY", "text": "IITALY: запрошенная сводка по вашему плану поступления за неделю {{1}}. Ближайшие задачи: {{2}}. Полный список и актуальный статус доступны в вашем личном кабинете.", "example": { "body_text": [["21–27 сентября 2026", "Проверить документы до 24 сентября; подать заявку до 25 сентября"]] } },
+      { "type": "FOOTER", "text": "Отключить напоминания: ответьте СТОП." },
+      { "type": "BUTTONS", "buttons": [{ "type": "URL", "text": "Открыть план", "url": "https://iitaly.netlify.app/portal" }] }
+    ]
+  }
+]
