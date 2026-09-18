@@ -1,4 +1,4 @@
-name: Reminder review source
+name: Finalize isolated reminder integration
 on:
   push:
     branches: [fix/per-channel-deadline-reminders]
@@ -6,16 +6,140 @@ on:
 permissions:
   contents: read
 jobs:
-  source:
+  integrate:
     runs-on: ubuntu-latest
-    timeout-minutes: 3
+    timeout-minutes: 4
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
         with:
-          persist-credentials: false
-      - run: git archive --format=tar.gz --output=/tmp/reminder-source.tar.gz HEAD
+          node-version: '22'
+      - name: Apply only the reviewed server integration
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import subprocess
+          def blob(path):
+              return subprocess.check_output(['git','hash-object',path],text=True).strip()
+          assert blob('server.js') == '7e5727a1b8bf7ab445351e138f82ae3e54606756'
+          assert blob('.env.example') == 'adb2d6f2138ccd6d06ebd069c00f09c364ca588f'
+          p=Path('server.js');s=p.read_text()
+          s=s.replace('const { buildRoadmap, defaultIntakeYear } = require("./roadmap");','const { buildRoadmap, defaultIntakeYear } = require("./roadmap");\nconst { createReminderRunner, RETRY_MS } = require("./reminders");\nconst { sendTelegramReminder } = require("./reminder-telegram");',1)
+          s=s.replace('    await mailer.sendMail({','    const info = await mailer.sendMail({',1)
+          s=s.replace('    return true;\n  } catch (e) {\n    console.error("mail failed:", e.message);','    // SMTP acceptance for THIS recipient, not just a resolved promise.\n    return Array.isArray(info.accepted) && info.accepted.some(address =>\n      String(typeof address === "string" ? address : address.address).toLowerCase() === to.toLowerCase());\n  } catch (e) {\n    console.error("mail failed");',1)
+          start=s.index('/* ================= НАПОМИНАНИЯ О ДЕДЛАЙНАХ')
+          end=s.index('function listClients()',start)
+          s=s[:start]+'''/* ================= НАПОМИНАНИЯ О ДЕДЛАЙНАХ =================
+             Сводка в понедельник и срочные пороги 7/3/1 день. Статус каждого
+             получателя хранится отдельно; удачная отправка владельцу не закрывает
+             неудачную попытку студенту. Логика и изолированные тесты — reminders.js. */
+
+          '''+s[end:]
+          start=s.index('async function tgSend(text)')
+          end=s.index('// --- Аналитика: приём событий ---',start)
+          s=s[:start]+'''// Receipt updates must not truncate an existing client file if a write fails.
+          // Same encrypted format, same volume; rename only after the temporary write.
+          function writeReminderClient(code, data) {
+            if (!validCode(code)) return false;
+            const destination = clientPath(code);
+            const temporary = destination + ".reminder-" + crypto.randomBytes(8).toString("hex") + ".tmp";
+            try {
+              const json = JSON.stringify(data, null, 2);
+              fs.writeFileSync(temporary, encKey ? encrypt(json) : json, { mode: 0o600, flag: "wx" });
+              fs.renameSync(temporary, destination);
+              return true;
+            } catch {
+              try { fs.unlinkSync(temporary); } catch { /* best effort */ }
+              console.warn("REMINDERS: receipt write failed");
+              return false;
+            }
+          }
+
+          const runReminders = createReminderRunner({
+            listCodes: () => listClients().map(file => file.replace(/\\.json$/, "")),
+            readClient,
+            writeClient: writeReminderClient,
+            buildRoadmap: client => buildRoadmap(null, client.profile, client.intakeYear),
+            siteUrl: process.env.SITE_URL || "https://iitaly.netlify.app",
+            channelsFor: client => ({
+              telegram: {
+                enabled: Boolean(process.env.TG_BOT_TOKEN && client.tgChatId && client.notify && client.notify.telegram !== false),
+                target: client.tgChatId,
+                transport: "telegram",
+                send: text => sendTelegramReminder(process.env.TG_BOT_TOKEN, client.tgChatId, text),
+              },
+              email: {
+                enabled: Boolean(mailer && client.email && client.notify && client.notify.email !== false),
+                target: client.email,
+                transport: "email",
+                send: async (text, subject) => ({ ok: await sendMail(client.email, subject, text) }),
+              },
+              owner: {
+                enabled: Boolean(process.env.TG_BOT_TOKEN && process.env.TG_CHAT_ID),
+                target: process.env.TG_CHAT_ID,
+                transport: "telegram",
+                send: text => sendTelegramReminder(process.env.TG_BOT_TOKEN, process.env.TG_CHAT_ID, text),
+              },
+            }),
+          });
+
+          // A lightweight tick retries failed channels; receipts prevent repeat sends.
+          // Existing opt-out switch and legacy replay suppression are preserved.
+          if (process.env.REMINDERS !== "off") {
+            setTimeout(() => { runReminders().catch(() => console.warn("REMINDERS: tick failed")); }, 60 * 1000);
+            setInterval(() => { runReminders().catch(() => console.warn("REMINDERS: tick failed")); }, RETRY_MS);
+          }
+
+          // Existing authenticated manual endpoint; uses the same single-flight runner.
+          app.get("/api/reminders/run", async (req, res) => {
+            const key = process.env.STATS_KEY;
+            if (!key || req.query.key !== key) return res.status(403).json({ ok: false, error: "forbidden" });
+            try {
+              const result = await runReminders();
+              res.json({ ok: true, ...result });
+            } catch {
+              res.status(500).json({ ok: false, error: "Не удалось проверить напоминания" });
+            }
+          });
+
+          '''+s[end:]
+          p.write_text(s)
+          p=Path('.env.example');s=p.read_text().replace('# REMINDERS=off отключает суточный планировщик напоминаний (для локальной разработки).','# REMINDERS=off отключает планировщик напоминаний (для локальной разработки).\n# Проверка каждые 15 минут; после сбоя отдельного канала — пауза 15м…6ч,\n# либо дольше при retry_after/блокировке. Успешные отправки не повторяются.')
+          p.write_text(s)
+          expected={
+            'server.js':'c667f14a38f8802b43438e0ce4a04a9ac71c1f86',
+            '.env.example':'cf948d1975413f0f1c76a2d68deae6b78239bd3a',
+            '.github/workflows/ci.yml':'b7725bddab023d1d8c65824c0a4d25956abb8347',
+            'reminders.js':'e2e427ffded5265c7a5b2900012ed0434aa35b64',
+            'reminder-telegram.js':'a2badf6481fde9f3bdb58921223361b7e07e0b39',
+            'test/reminders.test.js':'c6ad16bf00f15e387bd8f2ed6dd043e9ad2be5a1',
+            'test/reminders-server.test.js':'a7d899932114ef5727224670ebd3a5e67974db6a',
+            'docs/reminder-delivery.md':'dc02706278590439e7c1b26f66810b3c5c795752',
+          }
+          for name,sha in expected.items():
+              assert blob(name)==sha, (name,blob(name),sha)
+          PY
+      - name: Check syntax and offline behavior before committing
+        run: |
+          node --check server.js
+          set -o pipefail
+          node --test test/*.test.js | tee /tmp/reminder-tests.tap
+      - name: Commit only to the isolated review branch
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add server.js .env.example
+          git rm .github/workflows/reminder-review-source.yml
+          git commit -m 'fix: wire independently persisted deadline reminder deliveries'
+          git push origin HEAD:refs/heads/fix/per-channel-deadline-reminders
+          git archive --format=tar.gz --output=/tmp/reviewed-reminder-source.tar.gz HEAD
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
-          name: reminder-source
-          path: /tmp/reminder-source.tar.gz
-          retention-days: 3
+          name: reviewed-reminder-source
+          path: |
+            /tmp/reviewed-reminder-source.tar.gz
+            /tmp/reminder-tests.tap
+          retention-days: 7
