@@ -110,6 +110,39 @@ async function appendSummary(summary) {
 }
 
 
+
+async function sendTelegramProbeOnce() {
+  const probeId = process.env.TG_STAGING_PROBE_ID || '';
+  const token = process.env.TG_BOT_TOKEN || '';
+  const chatId = process.env.TG_CHAT_ID || '';
+  if (!probeId || !token || !chatId) return;
+  const marker = join(DATA_DIR, 'tg-probe-' + createHmac('sha256', APP_SECRET || 'probe').update(probeId).digest('hex').slice(0, 20));
+  try {
+    await readFile(marker, 'utf8');
+    console.log('Telegram staging probe: already sent');
+    return;
+  } catch (error) {
+    if (error?.code !== 'ENOENT') throw error;
+  }
+  const response = await fetch('https://api.telegram.org/bot' + token + '/sendMessage', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      chat_id: chatId,
+      text: 'IITALY test: Telegram-канал подключён. Это одноразовая staging-проверка доставки.',
+    }),
+  });
+  const body = await response.json().catch(() => null);
+  if (!response.ok || !body?.ok || !body?.result?.message_id) {
+    console.log('Telegram staging probe: send failed');
+    return;
+  }
+  const handle = await open(marker, 'wx', 0o600);
+  try { await handle.writeFile(new Date().toISOString(), 'utf8'); await handle.sync(); }
+  finally { await handle.close(); }
+  console.log('Telegram staging probe: accepted by Telegram');
+}
+
 async function auditTelegram() {
   const token = process.env.TG_BOT_TOKEN;
   if (!token) {
@@ -218,6 +251,7 @@ app.post(
 initialiseStorage()
   .then(async () => {
     await auditTelegram();
+    await sendTelegramProbeOnce();
     app.listen(PORT, () => {
       console.log(`IITALY WhatsApp staging webhook listening on :${PORT}; persisted=${persistedCount}`);
     });
