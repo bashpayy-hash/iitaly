@@ -938,7 +938,7 @@ function writeReminderClient(code, data) {
   }
 }
 
-const runReminders = createReminderRunner({
+const baseRunReminders = createReminderRunner({
   listCodes: () => listClients().map(file => file.replace(/\.json$/, "")),
   readClient,
   writeClient: writeReminderClient,
@@ -965,6 +965,12 @@ const runReminders = createReminderRunner({
     },
   }),
 });
+let lastReminderStats = null;
+async function runReminders() {
+  const result = await baseRunReminders();
+  lastReminderStats = { ...result, at: new Date().toISOString() };
+  return result;
+}
 
 // A lightweight tick retries failed channels; receipts prevent repeat sends.
 // Existing opt-out switch and legacy replay suppression are preserved.
@@ -1062,36 +1068,157 @@ app.post("/api/lead", orderLimit, async (req, res) => {
   }
 });
 
-// --- Приём заказов микро-продуктов ---
-// Заказ логируется и (если настроен Telegram-бот) улетает основателю.
-// Env: TG_BOT_TOKEN (токен бота от @BotFather), TG_CHAT_ID (твой chat id от @userinfobot)
+// --- Приём заказов ---
 app.post("/api/order", orderLimit, async (req, res) => {
   try {
-    const { product, price, name, phone } = req.body || {};
+    const { product, price, name, surname, phone } = req.body || {};
     if (typeof product !== "string" || product.length > 100 ||
-        typeof name !== "string" || name.length < 2 || name.length > 60 ||
+        typeof name !== "string" || name.trim().length < 2 || name.length > 60 ||
+        (surname != null && (typeof surname !== "string" || surname.length > 60)) ||
         typeof phone !== "string" || !/^[+0-9() -]{10,18}$/.test(phone)) {
-      return res.status(400).json({ ok: false, error: "Проверь имя и телефон." });
+      return res.status(400).json({ ok: false, error: "Проверь имя, фамилию и телефон." });
     }
-    const line = `${new Date().toISOString()} | ${product} | ${price || "?"} ₸ | ${name} | ${phone}`;
-    console.log("ORDER:", product, price + " ₸");   // имя и телефон только в Telegram, не в логах
-    fs.appendFile(ORDERS_LOG, line + "\n", () => {});
+
+    const order = orderStore.create({ product, price, name, surname, phone });
+    fs.appendFile(ORDERS_LOG,
+      [order.createdAt, order.id, order.product, order.price == null ? "?" : order.price, order.status].join("\t") + "\n",
+      () => {});
+    console.log("ORDER CREATED:", order.id);
 
     const token = process.env.TG_BOT_TOKEN, chat = process.env.TG_CHAT_ID;
     if (token && chat) {
-      fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+      fetch("https://api.telegram.org/bot" + token + "/sendMessage", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           chat_id: chat,
-          text: `🛒 Новый заказ IITALY\n${product} — ${price || "?"} ₸\n${name}, ${phone}`,
+          text: "🛒 Новый заказ IITALY\n" + order.product + " — " + (order.price || "?") + " ₸\n"
+            + order.name + (order.surname ? " " + order.surname : "") + ", " + order.phone + "\nID: " + order.id,
         }),
-      }).catch((e) => console.error("tg notify failed:", e.message));
+      }).catch(() => console.error("tg notify failed"));
     }
-    res.json({ ok: true });
-  } catch (e) {
-    console.error("order error:", e.message);
+    res.json({ ok: true, orderId: order.id });
+  } catch {
+    console.error("order error");
     res.status(500).json({ ok: false, error: "Ошибка сервера." });
+  }
+});
+
+function safeAdminKey(value) {
+  const key = String(process.env.STATS_KEY || "");
+  const supplied = String(value || "");
+  if (!key || !supplied) return false;
+  const a = Buffer.from(key), b = Buffer.from(supplied);
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
+}
+
+function adminAuth(req, res, next) {
+  const auth = String(req.headers.authorization || "");
+  const token = auth.startsWith("Bearer ") ? auth.slice(7) : "";
+  if (!safeAdminKey(token)) return res.status(403).json({ ok: false, error: "forbidden" });
+  next();
+}
+
+function clientAdminSummary(client) {
+  const roadmap = buildRoadmap(null, client.profile, client.intakeYear);
+  let total = 0, done = 0;
+  for (const stage of roadmap) for (const task of stage.tasks || []) {
+    total++; if (client.done && client.done[task.id]) done++;
+  }
+  return {
+    code: client.code,
+    name: client.name,
+    surname: client.surname,
+    phone: client.phone || "",
+    createdAt: client.createdAt,
+    intakeYear: client.intakeYear,
+    tgLinked: Boolean(client.tgChatId),
+    progress: { done, total, pct: total ? Math.round(done / total * 100) : 0 },
+    sourceOrderId: client.sourceOrderId || null,
+  };
+}
+
+app.get("/api/admin/overview", adminAuth, (_req, res) => {
+  const clients = [];
+  for (const file of listClients()) {
+    const client = readClient(file.replace(/\.json$/, ""));
+    if (client) clients.push(clientAdminSummary(client));
+  }
+  const orders = orderStore.list().map(order => ({
+    id: order.id,
+    status: order.status,
+    createdAt: order.createdAt,
+    updatedAt: order.updatedAt,
+    product: order.product,
+    price: order.price,
+    name: order.name,
+    surname: order.surname || "",
+    phone: order.phone,
+    portalCode: order.portalCode || null,
+    activatedAt: order.activatedAt || null,
+  }));
+  res.json({
+    ok: true,
+    orders,
+    clients: clients.sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt))),
+    reminder: lastReminderStats,
+    storage: { persistent: STORE_DIR === DATA_DIR },
+  });
+});
+
+app.post("/api/admin/orders/:id/confirm", adminAuth, async (req, res) => {
+  const order = orderStore.read(String(req.params.id || ""));
+  if (!order) return res.status(404).json({ ok: false, error: "Заказ не найден" });
+
+  let existing = order.portalCode ? readClient(order.portalCode) : findClientByOrderId(order.id);
+  if (existing) {
+    if (!order.portalCode) {
+      order.portalCode = existing.code;
+      order.status = "activated";
+      order.activatedAt = order.activatedAt || existing.createdAt;
+      order.updatedAt = new Date().toISOString();
+      orderStore.write(order);
+    }
+    return res.json({ ok: true, code: existing.code, name: existing.name, surname: existing.surname, phone: order.phone, alreadyActivated: true });
+  }
+
+  const surname = String(order.surname || req.body?.surname || "").trim();
+  if (surname.length < 2) return res.status(400).json({ ok: false, error: "Для активации нужна фамилия" });
+
+  const created = createPortalClient({
+    name: order.name,
+    surname,
+    phone: order.phone,
+    profile: req.body?.profile && typeof req.body.profile === "object" ? req.body.profile : {},
+    intakeYear: Number(req.body?.intakeYear),
+    sourceOrderId: order.id,
+  });
+  if (!created.ok) return res.status(500).json({ ok: false, error: "Не удалось создать кабинет" });
+
+  order.surname = surname;
+  order.status = "activated";
+  order.portalCode = created.code;
+  order.activatedAt = new Date().toISOString();
+  order.updatedAt = order.activatedAt;
+  if (!orderStore.write(order)) return res.status(500).json({ ok: false, error: "Кабинет создан, но статус заказа не сохранился" });
+
+  const token = process.env.TG_BOT_TOKEN, chat = process.env.TG_CHAT_ID;
+  if (token && chat) {
+    fetch("https://api.telegram.org/bot" + token + "/sendMessage", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ chat_id: chat, text: "✅ Оплата подтверждена\n" + order.id + "\nКабинет: " + created.code }),
+    }).catch(() => {});
+  }
+
+  res.json({ ok: true, code: created.code, name: created.data.name, surname: created.data.surname, phone: order.phone, alreadyActivated: false });
+});
+
+app.post("/api/admin/reminders/run", adminAuth, async (_req, res) => {
+  try {
+    const result = await runReminders();
+    res.json({ ok: true, ...result });
+  } catch {
+    res.status(500).json({ ok: false, error: "Не удалось запустить напоминания" });
   }
 });
 
