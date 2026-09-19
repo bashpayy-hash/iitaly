@@ -37,6 +37,7 @@ function createServerHarness(t, { enabled = false } = {}) {
       post(url, ...handlers) { routes.set('POST ' + url, handlers.at(-1)); } };
     const express = () => app;
     express.json = () => () => {};
+    express.raw = () => () => {};
     const context = vm.createContext({ __dirname: root, Buffer, URL, AbortController,
       console: { log() {}, warn() {}, error() {} }, process: { env },
       setTimeout(fn, ms) { timeouts.push({ fn, ms }); return timeouts.length; }, clearTimeout() {},
