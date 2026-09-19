@@ -1219,6 +1219,15 @@ app.post("/api/admin/orders/:id/confirm", adminAuth, async (req, res) => {
   res.json({ ok: true, code: created.code, name: created.data.name, surname: created.data.surname, phone: order.phone, alreadyActivated: false });
 });
 
+app.post("/api/admin/clients/create", adminAuth, async (req, res) => {
+  const created = createPortalClient(req.body || {});
+  if (!created.ok) {
+    const status = created.error === "name" ? 400 : 500;
+    return res.status(status).json({ ok: false, error: created.error === "name" ? "Укажи имя и фамилию" : "Не удалось создать кабинет" });
+  }
+  res.json({ ok: true, code: created.code, name: created.data.name, surname: created.data.surname, phone: created.data.phone || "" });
+});
+
 app.post("/api/admin/reminders/run", adminAuth, async (_req, res) => {
   try {
     const result = await runReminders();
