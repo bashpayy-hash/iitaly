@@ -23,7 +23,7 @@ jobs:
       - run: npm ci
 
       - name: Синтаксис
-        run: node --check server.js && node --check roadmap.js && node --check smoke-test.js && node --check reminders.js && node --check reminder-telegram.js
+        run: node --check server.js && node --check roadmap.js && node --check smoke-test.js && node --check reminders.js && node --check reminder-telegram.js && node --check telegram-linking.js
 
       - name: Изолированные проверки напоминаний
         run: |
@@ -40,6 +40,7 @@ jobs:
           STATS_KEY: ci-test-key
           REMINDERS: "off"
           PORT: "3000"
+          TG_BOT_NAME: "IitalyReminderTestBot"
         run: |
           export DATA_DIR="$RUNNER_TEMP/iitaly-data"
           node server.js & echo $! > /tmp/server.pid

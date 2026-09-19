@@ -78,7 +78,36 @@ async function j(method, path, body) {
   r = await j("POST", "/api/portal/lookup", { code: "../../etc", surname: "x" });
   ok(r.status === 404, "POST /api/portal/lookup обход каталога → 404");
 
-  /* 15. Цены в промпте совпадают с ценами на сайте.
+  // 15. Telegram: кабинет создаёт одноразовую ссылку без кода доступа в URL
+  r = await j("POST", "/api/portal/create", {
+    key: KEY,
+    name: "Telegram",
+    surname: "Testov",
+    phone: "",
+    email: "",
+    profile: {},
+    intakeYear: 2027,
+  });
+  const tgCode = r.data?.code;
+  ok(r.status === 200 && typeof tgCode === "string", "POST /api/portal/create для Telegram-теста → 200");
+
+  r = await j("POST", "/api/portal/" + encodeURIComponent(tgCode) + "/telegram-link", { surname: "Testov" });
+  const tgUrl = String(r.data?.url || "");
+  ok(r.status === 200 && r.data?.ok === true && /^https:\/\/t\.me\/IitalyReminderTestBot\?start=[A-Za-z0-9_-]{32,64}$/.test(tgUrl),
+    "POST /api/portal/:code/telegram-link → одноразовая t.me ссылка");
+  ok(!tgUrl.includes(tgCode), "Telegram-ссылка не содержит код кабинета");
+
+  r = await j("POST", "/api/portal/lookup", { code: tgCode, surname: "Testov" });
+  ok(r.status === 200 && r.data?.client?.notify?.email === false,
+    "новый кабинет не обещает email-рассылку без настроенной почты");
+
+  r = await j("POST", "/api/portal/" + encodeURIComponent(tgCode) + "/delete", {
+    surname: "Testov",
+    confirm: "УДАЛИТЬ",
+  });
+  ok(r.status === 200 && r.data?.ok === true, "тестовый кабинет удалён");
+
+  /* 19. Цены в промпте совпадают с ценами на сайте.
      Проверка статическая и стоит здесь не случайно: расхождение уже
      случалось — промпт называл 27 000 ₸, пока витрина показывала
      25 000 ₸, и это заметили не тесты, а разбор кода. Цифры внизу

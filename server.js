@@ -7,6 +7,7 @@ const fs = require("fs");
 const { buildRoadmap, defaultIntakeYear } = require("./roadmap");
 const { createReminderRunner, RETRY_MS } = require("./reminders");
 const { sendTelegramReminder } = require("./reminder-telegram");
+const { makeLinkToken, findClientByToken } = require("./telegram-linking");
 
 /* ---------- Почта ----------
    Настраивается переменными SMTP_HOST, SMTP_USER, SMTP_PASS, SMTP_FROM.
@@ -159,7 +160,8 @@ function readClient(code) {
     }
     return JSON.parse(raw);
   } catch (e) {
-    console.error("read client failed:", e.message);
+    if (e && e.code === "ENOENT") return null;
+    console.error("read client failed");
     return null;
   }
 }
@@ -539,7 +541,7 @@ app.post("/api/portal/create", async (req, res) => {
       phone: typeof phone === "string" ? phone.slice(0, 20) : "",
       email: typeof email === "string" && /.+@.+\..+/.test(email) ? email.trim().slice(0, 80) : "",
       tgChatId: null,          // заполнится, когда клиент нажмёт Start у бота
-      notify: { email: true, telegram: true },
+      notify: { email: false, telegram: true },
       profile: profile && typeof profile === "object" ? profile : {},
       intakeYear: Number.isInteger(intakeYear) && intakeYear > 2024 && intakeYear < 2100
         ? intakeYear : defaultIntakeYear(),
@@ -549,7 +551,7 @@ app.post("/api/portal/create", async (req, res) => {
     };
     if (!writeClient(code, data)) return res.status(500).json({ ok: false, error: "Не удалось сохранить" });
 
-    console.log("PORTAL CREATED: " + code);   // без имени: логи хранит хостинг
+    console.log("PORTAL CREATED");
     const token = process.env.TG_BOT_TOKEN, chat = process.env.TG_CHAT_ID;
     if (token && chat) {
       fetch("https://api.telegram.org/bot" + token + "/sendMessage", {
@@ -719,7 +721,7 @@ app.post("/api/portal/:code/delete", portalLimit, (req, res) => {
   } catch (e) {
     return res.status(500).json({ ok: false, error: "Не удалось удалить" });
   }
-  console.log("PORTAL DELETED: " + code);
+  console.log("PORTAL DELETED");
   const token = process.env.TG_BOT_TOKEN, chat = process.env.TG_CHAT_ID;
   if (token && chat) {
     fetchWithTimeout("https://api.telegram.org/bot" + token + "/sendMessage", {
@@ -747,15 +749,45 @@ app.post("/api/portal/:code/notify", portalLimit, (req, res) => {
   if (typeof notifyEmail === "boolean") c.notify.email = notifyEmail;
   if (typeof notifyTelegram === "boolean") {
     c.notify.telegram = notifyTelegram;
-    if (!notifyTelegram) c.tgChatId = null;
+    if (!notifyTelegram) {
+      c.tgChatId = null;
+      delete c.tgLink;
+    }
   }
   if (!writeClient(code, c)) return res.status(500).json({ ok: false, error: "Не удалось сохранить" });
   res.json({ ok: true, email: c.email || "", tgLinked: !!c.tgChatId, notify: c.notify });
 });
 
+/* ---------- Безопасная одноразовая ссылка Telegram ----------
+   Код кабинета — часть учётных данных и не должен попадать в t.me URL.
+   Кабинет выдаёт случайный токен на 15 минут; на диске хранится только
+   SHA-256 хеш. После успешного /start запись удаляется и повторно не работает. */
+app.post("/api/portal/:code/telegram-link", portalLimit, (req, res) => {
+  const code = String(req.params.code || "").toUpperCase().slice(0, 12);
+  const c = readClient(code);
+  if (!c) return res.status(404).json({ ok: false, error: "Не нашли бронь" });
+  if (normSurname(req.body && req.body.surname) !== normSurname(c.surname)) {
+    return res.status(403).json({ ok: false, error: "Нет доступа" });
+  }
+
+  const botName = String(process.env.TG_BOT_NAME || "").replace(/^@/, "").trim();
+  if (!/^[A-Za-z][A-Za-z0-9_]{4,31}$/.test(botName)) {
+    return res.status(503).json({ ok: false, error: "Telegram-бот временно недоступен" });
+  }
+
+  const link = makeLinkToken();
+  c.tgLink = link.record;
+  if (!writeClient(code, c)) return res.status(500).json({ ok: false, error: "Не удалось создать ссылку" });
+
+  res.json({
+    ok: true,
+    url: "https://t.me/" + botName + "?start=" + encodeURIComponent(link.token),
+    expiresAt: link.record.expiresAt,
+  });
+});
+
 /* ---------- Подписка клиента на бота ----------
-   Студент открывает ссылку t.me/бот?start=КОД, жмёт Start —
-   Telegram шлёт сюда апдейт, и мы привязываем его чат к кабинету. */
+   Telegram получает только случайный одноразовый токен, а не код кабинета. */
 app.post("/api/tg/webhook", async (req, res) => {
   res.json({ ok: true });                       // отвечаем сразу, Telegram не ждёт
   try {
@@ -767,7 +799,6 @@ app.post("/api/tg/webhook", async (req, res) => {
     const chatId = msg.chat.id;
     const text = String(msg.text).trim();
 
-    // отписка: обещали команду — она должна работать
     if (/^\/stop\b/i.test(text)) {
       const files = listClients();
       let off = 0;
@@ -777,6 +808,7 @@ app.post("/api/tg/webhook", async (req, res) => {
           cl.tgChatId = null;
           cl.notify = cl.notify || {};
           cl.notify.telegram = false;
+          delete cl.tgLink;
           writeClient(cl.code, cl);
           off++;
         }
@@ -787,30 +819,41 @@ app.post("/api/tg/webhook", async (req, res) => {
       return;
     }
 
-    const m = text.match(/^\/start\s+([A-Z0-9-]{4,12})$/i);
+    const m = text.match(/^\/start\s+([A-Za-z0-9_-]{32,64})$/);
     if (!m) {
-      if (/^\/start/.test(text)) {
-        await tgSendTo(chatId, "Это бот напоминаний IItaly. Открой кабинет на сайте и нажми «Включить напоминания» — ссылка придёт с твоим кодом.");
+      if (/^\/start\b/i.test(text)) {
+        await tgSendTo(chatId, "Это бот напоминаний IITALY. Открой личный кабинет на сайте и нажми «Подключить Telegram», чтобы получить новую безопасную ссылку.");
       }
       return;
     }
 
-    const code = m[1].toUpperCase();
-    const c = readClient(code);
-    if (!c) { await tgSendTo(chatId, "Не нашли кабинет по этому коду. Проверь ссылку."); return; }
+    const match = findClientByToken(
+      m[1],
+      () => listClients().map(f => f.replace(/\.json$/, "")),
+      readClient,
+    );
+    if (!match) {
+      await tgSendTo(chatId, "Ссылка недействительна или истекла. Вернись в кабинет IITALY и создай новую.");
+      return;
+    }
 
+    const c = match.client;
     c.tgChatId = chatId;
     c.notify = c.notify || {};
     c.notify.telegram = true;
-    writeClient(code, c);
+    delete c.tgLink;
+    if (!writeClient(match.code, c)) {
+      await tgSendTo(chatId, "Не удалось сохранить подключение. Вернись в кабинет и попробуй ещё раз.");
+      return;
+    }
 
     await tgSendTo(chatId, "Готово, " + c.name + "! Напоминания включены.\n\n"
       + "По понедельникам буду присылать сводку по ближайшим шагам, "
       + "а если до дедлайна останется 7, 3 или 1 день — напишу отдельно.\n\n"
       + "Отключить: /stop");
-    console.log("TG SUBSCRIBED: " + code + " → chat " + chatId);
-  } catch (e) {
-    console.error("tg webhook error:", e.message);
+    console.log("TG SUBSCRIBED");
+  } catch {
+    console.error("tg webhook error");
   }
 });
 
