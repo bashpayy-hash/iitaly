@@ -1237,6 +1237,38 @@ app.post("/api/admin/reminders/run", adminAuth, async (_req, res) => {
   }
 });
 
+
+// Optional synthetic demo account for regression testing.
+// Contains no real customer data and is deliberately isolated from orders.
+if (process.env.DEMO_PORTAL === "on") {
+  const demoCode = "DEMO-2027";
+  if (!readClient(demoCode)) {
+    const now = new Date().toISOString();
+    const demo = {
+      code: demoCode,
+      name: "Demo",
+      surname: "Testov",
+      phone: "",
+      email: "",
+      tgChatId: null,
+      notify: { email: false, telegram: true },
+      profile: {
+        education: "11 классов",
+        goal: "Бакалавриат",
+        budget: "Без стипендии будет сложно",
+      },
+      intakeYear: 2027,
+      done: {},
+      docs: {},
+      demo: true,
+      createdAt: now,
+      updatedAt: now,
+    };
+    if (writeClient(demoCode, demo)) console.log("DEMO PORTAL READY");
+    else console.warn("DEMO PORTAL: failed to seed");
+  }
+}
+
 const PORT = process.env.PORT || 3000;
 /* Проверка настроек при старте: лучше увидеть предупреждение в логах,
    чем обнаружить неработающую функцию через неделю. */
