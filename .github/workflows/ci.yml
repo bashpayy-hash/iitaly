@@ -23,7 +23,7 @@ jobs:
       - run: npm ci
 
       - name: Синтаксис
-        run: node --check server.js && node --check roadmap.js && node --check smoke-test.js && node --check reminders.js && node --check reminder-telegram.js && node --check telegram-linking.js
+        run: node --check server.js && node --check roadmap.js && node --check smoke-test.js && node --check reminders.js && node --check reminder-telegram.js && node --check telegram-linking.js && node --check order-store.js
 
       - name: Изолированные проверки напоминаний
         run: |

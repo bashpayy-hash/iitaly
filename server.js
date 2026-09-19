@@ -1,4 +1,4 @@
-// IItaly — прокси для ИИ-чата (production-ready)
+// IITALY — прокси для ИИ-чата (production-ready)
 // Запуск локально: ANTHROPIC_API_KEY=sk-... node server.js
 // Деплой: Railway / Render — ключ в env-переменной ANTHROPIC_API_KEY
 
@@ -8,6 +8,7 @@ const { buildRoadmap, defaultIntakeYear } = require("./roadmap");
 const { createReminderRunner, RETRY_MS } = require("./reminders");
 const { sendTelegramReminder } = require("./reminder-telegram");
 const { makeLinkToken, findClientByToken } = require("./telegram-linking");
+const { createOrderStore } = require("./order-store");
 
 /* ---------- Почта ----------
    Настраивается переменными SMTP_HOST, SMTP_USER, SMTP_PASS, SMTP_FROM.
@@ -34,7 +35,7 @@ async function sendMail(to, subject, text) {
   if (!mailer || !to) return false;
   try {
     const info = await mailer.sendMail({
-      from: process.env.SMTP_FROM || ("IItaly <" + process.env.SMTP_USER + ">"),
+      from: process.env.SMTP_FROM || ("IITALY <" + process.env.SMTP_USER + ">"),
       to, subject, text,
     });
     // SMTP acceptance for THIS recipient, not just a resolved promise.
@@ -75,7 +76,7 @@ app.use((req, res, next) => {
     res.header("Vary", "Origin");   // иначе CDN отдаст чужому сайту чужой заголовок
   }
   res.header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-  res.header("Access-Control-Allow-Headers", "Content-Type");
+  res.header("Access-Control-Allow-Headers", "Content-Type, Authorization");
   res.header("Access-Control-Max-Age", "86400");
   if (req.method === "OPTIONS") return res.sendStatus(204);   // preflight
   next();
@@ -182,6 +183,7 @@ function writeClient(code, data) {
 const EVENTS_LOG = STORE_DIR + "/events.log";
 const LEADS_LOG = STORE_DIR + "/leads.log";
 const ORDERS_LOG = STORE_DIR + "/orders.log";
+const orderStore = createOrderStore({ dir: STORE_DIR, key: DATA_KEY });
 
 /* Разовый перенос старых логов из образа на том. Без него после деплоя
    статистика начнётся с нуля, хотя данные за прошлый период существуют.
@@ -209,6 +211,48 @@ function makeCode() {
   let out = "";
   for (let i = 0; i < 8; i++) out += A[Math.floor(Math.random() * A.length)];
   return out.slice(0, 4) + "-" + out.slice(4);
+}
+
+
+function createPortalClient(fields) {
+  const name = String(fields.name || "").trim();
+  const surname = String(fields.surname || "").trim();
+  if (name.length < 2 || surname.length < 2) return { ok: false, error: "name" };
+
+  let code = makeCode();
+  for (let i = 0; i < 8 && readClient(code); i++) code = makeCode();
+  if (readClient(code)) return { ok: false, error: "code" };
+
+  const now = new Date().toISOString();
+  const data = {
+    code,
+    name: name.slice(0, 60),
+    surname: surname.slice(0, 60),
+    phone: typeof fields.phone === "string" ? fields.phone.slice(0, 20) : "",
+    email: typeof fields.email === "string" && /.+@.+\..+/.test(fields.email) ? fields.email.trim().slice(0, 80) : "",
+    tgChatId: null,
+    notify: { email: false, telegram: true },
+    profile: fields.profile && typeof fields.profile === "object" ? fields.profile : {},
+    intakeYear: Number.isInteger(fields.intakeYear) && fields.intakeYear > 2024 && fields.intakeYear < 2100
+      ? fields.intakeYear : defaultIntakeYear(),
+    done: {},
+    createdAt: now,
+    updatedAt: now,
+  };
+  if (fields.sourceOrderId) data.sourceOrderId = String(fields.sourceOrderId).slice(0, 32);
+  if (!writeClient(code, data)) return { ok: false, error: "write" };
+  return { ok: true, code, data };
+}
+
+function findClientByOrderId(orderId) {
+  try {
+    for (const file of fs.readdirSync(STORE_DIR + "/clients")) {
+      if (!file.endsWith(".json")) continue;
+      const client = readClient(file.replace(/\.json$/, ""));
+      if (client && client.sourceOrderId === orderId) return client;
+    }
+  } catch {}
+  return null;
 }
 
 // База знаний по документам DSU/ISU + промпт проверяющего
@@ -324,7 +368,21 @@ setInterval(() => {
 }, WINDOW_MS);
 
 // --- Health check для Railway/Render ---
-app.get("/health", (_req, res) => res.json({ ok: true }));
+app.get("/health", (_req, res) => {
+  let storageReady = false;
+  try {
+    fs.accessSync(STORE_DIR, fs.constants.R_OK | fs.constants.W_OK);
+    fs.accessSync(STORE_DIR + "/clients", fs.constants.R_OK | fs.constants.W_OK);
+    storageReady = STORE_DIR === DATA_DIR;
+  } catch {}
+  const ok = storageReady;
+  res.status(ok ? 200 : 503).json({
+    ok,
+    storage: storageReady ? "ready" : "unavailable",
+    telegramConfigured: Boolean(process.env.TG_BOT_TOKEN && process.env.TG_WEBHOOK_SECRET),
+    remindersEnabled: process.env.REMINDERS !== "off",
+  });
+});
 
 // --- Основной эндпоинт чата ---
 app.post("/api/chat", rateLimit, async (req, res) => {
@@ -526,42 +584,22 @@ app.post("/api/portal/create", async (req, res) => {
   try {
     const key = process.env.STATS_KEY;
     if (!key || req.body.key !== key) return res.status(403).json({ ok: false, error: "forbidden" });
-
-    const { name, surname, phone, email, profile, intakeYear } = req.body || {};
-    if (typeof name !== "string" || name.trim().length < 2) return res.status(400).json({ ok: false, error: "Укажи имя" });
-    if (typeof surname !== "string" || surname.trim().length < 2) return res.status(400).json({ ok: false, error: "Укажи фамилию" });
-
-    let code = makeCode();
-    for (let i = 0; i < 5 && readClient(code); i++) code = makeCode();
-
-    const data = {
-      code,
-      name: String(name).slice(0, 60),
-      surname: String(surname).slice(0, 60),
-      phone: typeof phone === "string" ? phone.slice(0, 20) : "",
-      email: typeof email === "string" && /.+@.+\..+/.test(email) ? email.trim().slice(0, 80) : "",
-      tgChatId: null,          // заполнится, когда клиент нажмёт Start у бота
-      notify: { email: false, telegram: true },
-      profile: profile && typeof profile === "object" ? profile : {},
-      intakeYear: Number.isInteger(intakeYear) && intakeYear > 2024 && intakeYear < 2100
-        ? intakeYear : defaultIntakeYear(),
-      done: {},
-      createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString(),
-    };
-    if (!writeClient(code, data)) return res.status(500).json({ ok: false, error: "Не удалось сохранить" });
-
+    const created = createPortalClient(req.body || {});
+    if (!created.ok) {
+      const status = created.error === "name" ? 400 : 500;
+      return res.status(status).json({ ok: false, error: created.error === "name" ? "Укажи имя и фамилию" : "Не удалось создать кабинет" });
+    }
     console.log("PORTAL CREATED");
     const token = process.env.TG_BOT_TOKEN, chat = process.env.TG_CHAT_ID;
     if (token && chat) {
       fetch("https://api.telegram.org/bot" + token + "/sendMessage", {
         method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ chat_id: chat, text: "\u{1F511} Кабинет создан\n" + data.surname + " " + data.name + "\nКод: " + code }),
+        body: JSON.stringify({ chat_id: chat, text: "🔑 Кабинет создан\n" + created.data.surname + " " + created.data.name + "\nКод: " + created.code }),
       }).catch(() => {});
     }
-    res.json({ ok: true, code });
-  } catch (e) {
-    console.error("portal create error:", e.message);
+    res.json({ ok: true, code: created.code });
+  } catch {
+    console.error("portal create error");
     res.status(500).json({ ok: false, error: "Внутренняя ошибка" });
   }
 });
@@ -900,7 +938,7 @@ function writeReminderClient(code, data) {
   }
 }
 
-const runReminders = createReminderRunner({
+const baseRunReminders = createReminderRunner({
   listCodes: () => listClients().map(file => file.replace(/\.json$/, "")),
   readClient,
   writeClient: writeReminderClient,
@@ -927,6 +965,12 @@ const runReminders = createReminderRunner({
     },
   }),
 });
+let lastReminderStats = null;
+async function runReminders() {
+  const result = await baseRunReminders();
+  lastReminderStats = { ...result, at: new Date().toISOString() };
+  return result;
+}
 
 // A lightweight tick retries failed channels; receipts prevent repeat sends.
 // Existing opt-out switch and legacy replay suppression are preserved.
@@ -1014,7 +1058,7 @@ app.post("/api/lead", orderLimit, async (req, res) => {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           chat_id: chat,
-          text: `👤 Новый лид IItaly\n${clean(education)} → ${clean(goal)}\nБюджет: ${clean(budget)}\nТел: ${clean(phone)}`,
+          text: `👤 Новый лид IITALY\n${clean(education)} → ${clean(goal)}\nБюджет: ${clean(budget)}\nТел: ${clean(phone)}`,
         }),
       }).catch(() => {});
     }
@@ -1024,36 +1068,157 @@ app.post("/api/lead", orderLimit, async (req, res) => {
   }
 });
 
-// --- Приём заказов микро-продуктов ---
-// Заказ логируется и (если настроен Telegram-бот) улетает основателю.
-// Env: TG_BOT_TOKEN (токен бота от @BotFather), TG_CHAT_ID (твой chat id от @userinfobot)
+// --- Приём заказов ---
 app.post("/api/order", orderLimit, async (req, res) => {
   try {
-    const { product, price, name, phone } = req.body || {};
+    const { product, price, name, surname, phone } = req.body || {};
     if (typeof product !== "string" || product.length > 100 ||
-        typeof name !== "string" || name.length < 2 || name.length > 60 ||
+        typeof name !== "string" || name.trim().length < 2 || name.length > 60 ||
+        (surname != null && (typeof surname !== "string" || surname.length > 60)) ||
         typeof phone !== "string" || !/^[+0-9() -]{10,18}$/.test(phone)) {
-      return res.status(400).json({ ok: false, error: "Проверь имя и телефон." });
+      return res.status(400).json({ ok: false, error: "Проверь имя, фамилию и телефон." });
     }
-    const line = `${new Date().toISOString()} | ${product} | ${price || "?"} ₸ | ${name} | ${phone}`;
-    console.log("ORDER:", product, price + " ₸");   // имя и телефон только в Telegram, не в логах
-    fs.appendFile(ORDERS_LOG, line + "\n", () => {});
+
+    const order = orderStore.create({ product, price, name, surname, phone });
+    fs.appendFile(ORDERS_LOG,
+      [order.createdAt, order.id, order.product, order.price == null ? "?" : order.price, order.status].join("\t") + "\n",
+      () => {});
+    console.log("ORDER CREATED:", order.id);
 
     const token = process.env.TG_BOT_TOKEN, chat = process.env.TG_CHAT_ID;
     if (token && chat) {
-      fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+      fetch("https://api.telegram.org/bot" + token + "/sendMessage", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           chat_id: chat,
-          text: `🛒 Новый заказ IItaly\n${product} — ${price || "?"} ₸\n${name}, ${phone}`,
+          text: "🛒 Новый заказ IITALY\n" + order.product + " — " + (order.price || "?") + " ₸\n"
+            + order.name + (order.surname ? " " + order.surname : "") + ", " + order.phone + "\nID: " + order.id,
         }),
-      }).catch((e) => console.error("tg notify failed:", e.message));
+      }).catch(() => console.error("tg notify failed"));
     }
-    res.json({ ok: true });
-  } catch (e) {
-    console.error("order error:", e.message);
+    res.json({ ok: true, orderId: order.id });
+  } catch {
+    console.error("order error");
     res.status(500).json({ ok: false, error: "Ошибка сервера." });
+  }
+});
+
+function safeAdminKey(value) {
+  const key = String(process.env.STATS_KEY || "");
+  const supplied = String(value || "");
+  if (!key || !supplied) return false;
+  const a = Buffer.from(key), b = Buffer.from(supplied);
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
+}
+
+function adminAuth(req, res, next) {
+  const auth = String(req.headers.authorization || "");
+  const token = auth.startsWith("Bearer ") ? auth.slice(7) : "";
+  if (!safeAdminKey(token)) return res.status(403).json({ ok: false, error: "forbidden" });
+  next();
+}
+
+function clientAdminSummary(client) {
+  const roadmap = buildRoadmap(null, client.profile, client.intakeYear);
+  let total = 0, done = 0;
+  for (const stage of roadmap) for (const task of stage.tasks || []) {
+    total++; if (client.done && client.done[task.id]) done++;
+  }
+  return {
+    code: client.code,
+    name: client.name,
+    surname: client.surname,
+    phone: client.phone || "",
+    createdAt: client.createdAt,
+    intakeYear: client.intakeYear,
+    tgLinked: Boolean(client.tgChatId),
+    progress: { done, total, pct: total ? Math.round(done / total * 100) : 0 },
+    sourceOrderId: client.sourceOrderId || null,
+  };
+}
+
+app.get("/api/admin/overview", adminAuth, (_req, res) => {
+  const clients = [];
+  for (const file of listClients()) {
+    const client = readClient(file.replace(/\.json$/, ""));
+    if (client) clients.push(clientAdminSummary(client));
+  }
+  const orders = orderStore.list().map(order => ({
+    id: order.id,
+    status: order.status,
+    createdAt: order.createdAt,
+    updatedAt: order.updatedAt,
+    product: order.product,
+    price: order.price,
+    name: order.name,
+    surname: order.surname || "",
+    phone: order.phone,
+    portalCode: order.portalCode || null,
+    activatedAt: order.activatedAt || null,
+  }));
+  res.json({
+    ok: true,
+    orders,
+    clients: clients.sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt))),
+    reminder: lastReminderStats,
+    storage: { persistent: STORE_DIR === DATA_DIR },
+  });
+});
+
+app.post("/api/admin/orders/:id/confirm", adminAuth, async (req, res) => {
+  const order = orderStore.read(String(req.params.id || ""));
+  if (!order) return res.status(404).json({ ok: false, error: "Заказ не найден" });
+
+  let existing = order.portalCode ? readClient(order.portalCode) : findClientByOrderId(order.id);
+  if (existing) {
+    if (!order.portalCode) {
+      order.portalCode = existing.code;
+      order.status = "activated";
+      order.activatedAt = order.activatedAt || existing.createdAt;
+      order.updatedAt = new Date().toISOString();
+      orderStore.write(order);
+    }
+    return res.json({ ok: true, code: existing.code, name: existing.name, surname: existing.surname, phone: order.phone, alreadyActivated: true });
+  }
+
+  const surname = String(order.surname || req.body?.surname || "").trim();
+  if (surname.length < 2) return res.status(400).json({ ok: false, error: "Для активации нужна фамилия" });
+
+  const created = createPortalClient({
+    name: order.name,
+    surname,
+    phone: order.phone,
+    profile: req.body?.profile && typeof req.body.profile === "object" ? req.body.profile : {},
+    intakeYear: Number(req.body?.intakeYear),
+    sourceOrderId: order.id,
+  });
+  if (!created.ok) return res.status(500).json({ ok: false, error: "Не удалось создать кабинет" });
+
+  order.surname = surname;
+  order.status = "activated";
+  order.portalCode = created.code;
+  order.activatedAt = new Date().toISOString();
+  order.updatedAt = order.activatedAt;
+  if (!orderStore.write(order)) return res.status(500).json({ ok: false, error: "Кабинет создан, но статус заказа не сохранился" });
+
+  const token = process.env.TG_BOT_TOKEN, chat = process.env.TG_CHAT_ID;
+  if (token && chat) {
+    fetch("https://api.telegram.org/bot" + token + "/sendMessage", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ chat_id: chat, text: "✅ Оплата подтверждена\n" + order.id + "\nКабинет: " + created.code }),
+    }).catch(() => {});
+  }
+
+  res.json({ ok: true, code: created.code, name: created.data.name, surname: created.data.surname, phone: order.phone, alreadyActivated: false });
+});
+
+app.post("/api/admin/reminders/run", adminAuth, async (_req, res) => {
+  try {
+    const result = await runReminders();
+    res.json({ ok: true, ...result });
+  } catch {
+    res.status(500).json({ ok: false, error: "Не удалось запустить напоминания" });
   }
 });
 
@@ -1100,4 +1265,4 @@ const PORT = process.env.PORT || 3000;
   if (!miss.length) console.log("Настройки в порядке");
 })();
 
-app.listen(PORT, () => console.log(`IItaly proxy up on :${PORT}`));
+app.listen(PORT, () => console.log(`IITALY proxy up on :${PORT}`));
