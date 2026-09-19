@@ -46,7 +46,13 @@ async function j(method, path, body) {
   r = await j("POST", "/api/order", { product: "x", price: 1, name: "A", phone: "abc" });
   ok(r.status === 400, "POST /api/order кривой телефон → 400");
 
-  // 7. lead
+  // 7. Stripe is safely disabled until account secrets are configured
+  r = await j("POST", "/api/stripe/checkout", {
+    product: "Поступление под ключ", name: "Тест", surname: "Пользователь", phone: "+77071234567"
+  });
+  ok(r.status === 503 && r.data?.ok === false, "POST /api/stripe/checkout без Stripe secret → 503");
+
+  // 8. lead
   r = await j("POST", "/api/lead", { education: "11 классов", goal: "Бакалавриат", budget: "Только со стипендией", phone: "+77071234567" });
   ok(r.status === 200, "POST /api/lead → 200");
 
