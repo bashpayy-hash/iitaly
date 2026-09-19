@@ -53,6 +53,7 @@ function createServerHarness(t, { enabled = false } = {}) {
           tasks: [{ id: 'uniApply', t: 'Подать заявку', daysLeft: 7, deadline: '2026-06-30' }] }] };
         if (name === './reminders') return { ...realReminders, createReminderRunner: config => realReminders.createReminderRunner({ ...config, now: () => new Date(time) }) };
         if (name === './reminder-telegram') return { sendTelegramReminder: (token, id, text) => require('../reminder-telegram').sendTelegramReminder(token, id, text, request) };
+        if (name === './telegram-linking') return require('../telegram-linking');
         if (name === 'nodemailer') return { createTransport: () => ({ sendMail: async options => {
           email.push(options);
           if (h.failEmail) throw new Error('SMTP fake failure');
