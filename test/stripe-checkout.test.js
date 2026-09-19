@@ -10,7 +10,7 @@ const {
   parseVerifiedEvent,
 } = require('../stripe-checkout');
 
-test('KZT checkout uses two-decimal minor units and card/wallet-compatible Checkout', async () => {
+test('KZT checkout uses two-decimal minor units and dynamic Stripe payment methods', async () => {
   let request;
   const result = await createCheckoutSession({
     secretKey: 'sk_test_synthetic',
@@ -26,7 +26,6 @@ test('KZT checkout uses two-decimal minor units and card/wallet-compatible Check
   assert.equal(request.url, 'https://api.stripe.com/v1/checkout/sessions');
   const body = new URLSearchParams(request.options.body);
   assert.equal(body.get('mode'), 'payment');
-  assert.equal(body.get('payment_method_types[0]'), 'card');
   assert.equal(body.get('line_items[0][price_data][currency]'), 'kzt');
   assert.equal(body.get('line_items[0][price_data][unit_amount]'), '2500000');
   assert.equal(body.get('client_reference_id'), 'ord_0123456789abcdef');

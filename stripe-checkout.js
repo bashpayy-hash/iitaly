@@ -20,7 +20,6 @@ async function createCheckoutSession({ secretKey, order, siteUrl, fetchImpl = fe
   body.set('cancel_url', base + '/prices?payment=cancelled');
   body.set('client_reference_id', order.id);
   body.set('metadata[order_id]', order.id);
-  body.set('payment_method_types[0]', 'card');
   body.set('line_items[0][quantity]', '1');
   body.set('line_items[0][price_data][currency]', CURRENCY);
   body.set('line_items[0][price_data][unit_amount]', String(minorUnits(order.price)));
