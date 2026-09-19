@@ -213,6 +213,48 @@ function makeCode() {
   return out.slice(0, 4) + "-" + out.slice(4);
 }
 
+
+function createPortalClient(fields) {
+  const name = String(fields.name || "").trim();
+  const surname = String(fields.surname || "").trim();
+  if (name.length < 2 || surname.length < 2) return { ok: false, error: "name" };
+
+  let code = makeCode();
+  for (let i = 0; i < 8 && readClient(code); i++) code = makeCode();
+  if (readClient(code)) return { ok: false, error: "code" };
+
+  const now = new Date().toISOString();
+  const data = {
+    code,
+    name: name.slice(0, 60),
+    surname: surname.slice(0, 60),
+    phone: typeof fields.phone === "string" ? fields.phone.slice(0, 20) : "",
+    email: typeof fields.email === "string" && /.+@.+\..+/.test(fields.email) ? fields.email.trim().slice(0, 80) : "",
+    tgChatId: null,
+    notify: { email: false, telegram: true },
+    profile: fields.profile && typeof fields.profile === "object" ? fields.profile : {},
+    intakeYear: Number.isInteger(fields.intakeYear) && fields.intakeYear > 2024 && fields.intakeYear < 2100
+      ? fields.intakeYear : defaultIntakeYear(),
+    done: {},
+    createdAt: now,
+    updatedAt: now,
+  };
+  if (fields.sourceOrderId) data.sourceOrderId = String(fields.sourceOrderId).slice(0, 32);
+  if (!writeClient(code, data)) return { ok: false, error: "write" };
+  return { ok: true, code, data };
+}
+
+function findClientByOrderId(orderId) {
+  try {
+    for (const file of fs.readdirSync(STORE_DIR + "/clients")) {
+      if (!file.endsWith(".json")) continue;
+      const client = readClient(file.replace(/\.json$/, ""));
+      if (client && client.sourceOrderId === orderId) return client;
+    }
+  } catch {}
+  return null;
+}
+
 // База знаний по документам DSU/ISU + промпт проверяющего
 let CHECK_PROMPT = "";
 try {
@@ -542,42 +584,22 @@ app.post("/api/portal/create", async (req, res) => {
   try {
     const key = process.env.STATS_KEY;
     if (!key || req.body.key !== key) return res.status(403).json({ ok: false, error: "forbidden" });
-
-    const { name, surname, phone, email, profile, intakeYear } = req.body || {};
-    if (typeof name !== "string" || name.trim().length < 2) return res.status(400).json({ ok: false, error: "Укажи имя" });
-    if (typeof surname !== "string" || surname.trim().length < 2) return res.status(400).json({ ok: false, error: "Укажи фамилию" });
-
-    let code = makeCode();
-    for (let i = 0; i < 5 && readClient(code); i++) code = makeCode();
-
-    const data = {
-      code,
-      name: String(name).slice(0, 60),
-      surname: String(surname).slice(0, 60),
-      phone: typeof phone === "string" ? phone.slice(0, 20) : "",
-      email: typeof email === "string" && /.+@.+\..+/.test(email) ? email.trim().slice(0, 80) : "",
-      tgChatId: null,          // заполнится, когда клиент нажмёт Start у бота
-      notify: { email: false, telegram: true },
-      profile: profile && typeof profile === "object" ? profile : {},
-      intakeYear: Number.isInteger(intakeYear) && intakeYear > 2024 && intakeYear < 2100
-        ? intakeYear : defaultIntakeYear(),
-      done: {},
-      createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString(),
-    };
-    if (!writeClient(code, data)) return res.status(500).json({ ok: false, error: "Не удалось сохранить" });
-
+    const created = createPortalClient(req.body || {});
+    if (!created.ok) {
+      const status = created.error === "name" ? 400 : 500;
+      return res.status(status).json({ ok: false, error: created.error === "name" ? "Укажи имя и фамилию" : "Не удалось создать кабинет" });
+    }
     console.log("PORTAL CREATED");
     const token = process.env.TG_BOT_TOKEN, chat = process.env.TG_CHAT_ID;
     if (token && chat) {
       fetch("https://api.telegram.org/bot" + token + "/sendMessage", {
         method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ chat_id: chat, text: "\u{1F511} Кабинет создан\n" + data.surname + " " + data.name + "\nКод: " + code }),
+        body: JSON.stringify({ chat_id: chat, text: "🔑 Кабинет создан\n" + created.data.surname + " " + created.data.name + "\nКод: " + created.code }),
       }).catch(() => {});
     }
-    res.json({ ok: true, code });
-  } catch (e) {
-    console.error("portal create error:", e.message);
+    res.json({ ok: true, code: created.code });
+  } catch {
+    console.error("portal create error");
     res.status(500).json({ ok: false, error: "Внутренняя ошибка" });
   }
 });
