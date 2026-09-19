@@ -1130,38 +1130,172 @@ function activatePortalOrder(order) {
 }
 
 // --- Приём заказов ---
+function validBuyerFields({ product, name, surname, phone }) {
+  return typeof product === "string" && product.length <= 100 &&
+    typeof name === "string" && name.trim().length >= 2 && name.length <= 60 &&
+    typeof surname === "string" && surname.trim().length >= 2 && surname.length <= 60 &&
+    typeof phone === "string" && /^[+0-9() -]{10,18}$/.test(phone);
+}
+
+// Legacy/manual order endpoint remains available for operational fallback.
 app.post("/api/order", orderLimit, async (req, res) => {
   try {
-    const { product, price, name, surname, phone } = req.body || {};
-    if (typeof product !== "string" || product.length > 100 ||
-        typeof name !== "string" || name.trim().length < 2 || name.length > 60 ||
-        (surname != null && (typeof surname !== "string" || surname.length > 60)) ||
-        typeof phone !== "string" || !/^[+0-9() -]{10,18}$/.test(phone)) {
-      return res.status(400).json({ ok: false, error: "Проверь имя, фамилию и телефон." });
+    const { product, name, surname, phone } = req.body || {};
+    const offer = productOffer(product);
+    if (!offer || !validBuyerFields({ product, name, surname, phone })) {
+      return res.status(400).json({ ok: false, error: "Проверь услугу, имя, фамилию и телефон." });
     }
 
-    const order = orderStore.create({ product, price, name, surname, phone });
+    const order = orderStore.create({ product, price: offer.price, name, surname, phone });
+    order.fulfillment = offer.fulfillment;
+    order.provider = "manual";
+    if (!orderStore.write(order)) return res.status(500).json({ ok: false, error: "Не удалось сохранить заказ." });
     fs.appendFile(ORDERS_LOG,
-      [order.createdAt, order.id, order.product, order.price == null ? "?" : order.price, order.status].join("\t") + "\n",
+      [order.createdAt, order.id, order.product, order.price, order.status, order.provider].join("\t") + "\n",
       () => {});
     console.log("ORDER CREATED:", order.id);
-
-    const token = process.env.TG_BOT_TOKEN, chat = process.env.TG_CHAT_ID;
-    if (token && chat) {
-      fetch("https://api.telegram.org/bot" + token + "/sendMessage", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          chat_id: chat,
-          text: "🛒 Новый заказ IITALY\n" + order.product + " — " + (order.price || "?") + " ₸\n"
-            + order.name + (order.surname ? " " + order.surname : "") + ", " + order.phone + "\nID: " + order.id,
-        }),
-      }).catch(() => console.error("tg notify failed"));
-    }
     res.json({ ok: true, orderId: order.id });
   } catch {
     console.error("order error");
     res.status(500).json({ ok: false, error: "Ошибка сервера." });
+  }
+});
+
+// Create a Stripe-hosted Checkout Session. The server owns the product price:
+// the browser cannot change 25 000 ₸ into another amount.
+app.post("/api/stripe/checkout", orderLimit, async (req, res) => {
+  try {
+    if (!process.env.STRIPE_SECRET_KEY) {
+      return res.status(503).json({ ok: false, error: "Оплата картой пока не настроена." });
+    }
+    const { product, name, surname, phone } = req.body || {};
+    const offer = productOffer(product);
+    if (!offer || !validBuyerFields({ product, name, surname, phone })) {
+      return res.status(400).json({ ok: false, error: "Проверь услугу, имя, фамилию и телефон." });
+    }
+
+    const access = makeOrderToken();
+    const order = orderStore.create({ product, price: offer.price, name, surname, phone });
+    Object.assign(order, {
+      fulfillment: offer.fulfillment,
+      provider: "stripe",
+      accessTokenHash: access.hash,
+      status: "checkout_creating",
+      updatedAt: new Date().toISOString(),
+    });
+    if (!orderStore.write(order)) {
+      return res.status(500).json({ ok: false, error: "Не удалось сохранить заказ." });
+    }
+
+    const session = await createCheckoutSession({
+      secretKey: process.env.STRIPE_SECRET_KEY,
+      order,
+      siteUrl: process.env.SITE_URL || "https://iitaly.kz",
+    });
+    if (!session.ok) {
+      order.status = "checkout_failed";
+      order.updatedAt = new Date().toISOString();
+      orderStore.write(order);
+      return res.status(502).json({ ok: false, error: "Stripe временно не создал страницу оплаты. Попробуй ещё раз." });
+    }
+
+    order.stripeSessionId = session.id;
+    order.status = "checkout_created";
+    order.updatedAt = new Date().toISOString();
+    if (!orderStore.write(order)) {
+      return res.status(500).json({ ok: false, error: "Сессия оплаты создана, но заказ не сохранился. Не оплачивай и попробуй ещё раз." });
+    }
+    fs.appendFile(ORDERS_LOG,
+      [order.createdAt, order.id, order.product, order.price, order.status, order.provider].join("\t") + "\n",
+      () => {});
+    console.log("STRIPE CHECKOUT CREATED:", order.id);
+    res.json({ ok: true, url: session.url, orderId: order.id, orderToken: access.token });
+  } catch {
+    console.error("stripe checkout error");
+    res.status(500).json({ ok: false, error: "Не удалось открыть оплату." });
+  }
+});
+
+// Browser polling after Stripe redirects back. Credentials are returned only
+// to the browser holding the random token created before checkout.
+app.post("/api/order/status", orderLimit, (req, res) => {
+  const { orderId, orderToken } = req.body || {};
+  const order = orderStore.read(String(orderId || ""));
+  if (!order || !orderTokenMatches(order, orderToken)) {
+    return res.status(404).json({ ok: false, error: "Заказ не найден." });
+  }
+  const payload = {
+    ok: true,
+    status: order.status,
+    fulfillment: order.fulfillment || "manual",
+    paidAt: order.paidAt || null,
+  };
+  if (order.status === "activated" && order.portalCode) {
+    payload.portal = { code: order.portalCode, surname: order.surname };
+  }
+  res.json(payload);
+});
+
+// Stripe signature verification must use the exact raw request bytes.
+// The raw parser is selected above specifically for this route.
+app.post("/api/stripe/webhook", async (req, res) => {
+  const secret = process.env.STRIPE_WEBHOOK_SECRET;
+  const event = parseVerifiedEvent(req.body, req.headers["stripe-signature"], secret);
+  if (!event) return res.status(400).json({ ok: false });
+
+  const session = event.data.object || {};
+  const orderId = String(session.metadata?.order_id || session.client_reference_id || "");
+  const order = orderStore.read(orderId);
+
+  if (event.type === "checkout.session.expired") {
+    if (order && order.stripeSessionId === session.id &&
+        !["paid", "activated"].includes(order.status)) {
+      order.status = "expired";
+      order.updatedAt = new Date().toISOString();
+      order.stripeEventId = event.id;
+      orderStore.write(order);
+    }
+    return res.json({ received: true });
+  }
+
+  if (!["checkout.session.completed", "checkout.session.async_payment_succeeded"].includes(event.type)) {
+    return res.json({ received: true });
+  }
+
+  if (!order || order.provider !== "stripe" || order.stripeSessionId !== session.id) {
+    return res.status(409).json({ ok: false });
+  }
+  if (session.payment_status !== "paid" ||
+      String(session.currency || "").toLowerCase() !== STRIPE_CURRENCY ||
+      Number(session.amount_total) !== minorUnits(order.price)) {
+    return res.status(409).json({ ok: false });
+  }
+
+  // Replayed Stripe events are harmless: fulfillment is idempotent.
+  order.paidAt = order.paidAt || new Date().toISOString();
+  order.stripeEventId = event.id;
+  order.stripePaymentIntent = typeof session.payment_intent === "string" ? session.payment_intent : null;
+  order.updatedAt = new Date().toISOString();
+
+  let fulfilled = null;
+  if (order.fulfillment === "portal") {
+    fulfilled = activatePortalOrder(order);
+    if (!fulfilled.ok) return res.status(500).json({ ok: false });
+  } else {
+    order.status = "paid";
+    if (!orderStore.write(order)) return res.status(500).json({ ok: false });
+  }
+
+  // Acknowledge only after the durable state change. The Telegram owner alert
+  // is best-effort and does not determine whether Stripe sees this as success.
+  res.json({ received: true });
+  const tgToken = process.env.TG_BOT_TOKEN, chat = process.env.TG_CHAT_ID;
+  if (tgToken && chat) {
+    const suffix = fulfilled?.code ? "\nКабинет: " + fulfilled.code : "\nТребуется ручное выполнение услуги.";
+    fetch("https://api.telegram.org/bot" + tgToken + "/sendMessage", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ chat_id: chat, text: "💳 Stripe: оплачено\n" + order.id + suffix }),
+    }).catch(() => {});
   }
 });
 
