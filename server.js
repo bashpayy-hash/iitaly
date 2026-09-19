@@ -74,6 +74,12 @@ app.use((req, res, next) => {
   } else if (origin && ALLOWED_ORIGINS.includes(origin)) {
     res.header("Access-Control-Allow-Origin", origin);
     res.header("Vary", "Origin");   // иначе CDN отдаст чужому сайту чужой заголовок
+  } else if (origin === "null" && req.path.startsWith("/api/admin/")) {
+    // Private tools/admin.html is intentionally not published with the site.
+    // A local file:// page has Origin: null; only admin routes allow it, and
+    // every admin handler still requires Authorization: Bearer STATS_KEY.
+    res.header("Access-Control-Allow-Origin", "null");
+    res.header("Vary", "Origin");
   }
   res.header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
   res.header("Access-Control-Allow-Headers", "Content-Type, Authorization");
@@ -1211,6 +1217,15 @@ app.post("/api/admin/orders/:id/confirm", adminAuth, async (req, res) => {
   }
 
   res.json({ ok: true, code: created.code, name: created.data.name, surname: created.data.surname, phone: order.phone, alreadyActivated: false });
+});
+
+app.post("/api/admin/clients/create", adminAuth, async (req, res) => {
+  const created = createPortalClient(req.body || {});
+  if (!created.ok) {
+    const status = created.error === "name" ? 400 : 500;
+    return res.status(status).json({ ok: false, error: created.error === "name" ? "Укажи имя и фамилию" : "Не удалось создать кабинет" });
+  }
+  res.json({ ok: true, code: created.code, name: created.data.name, surname: created.data.surname, phone: created.data.phone || "" });
 });
 
 app.post("/api/admin/reminders/run", adminAuth, async (_req, res) => {
