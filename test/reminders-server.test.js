@@ -55,6 +55,7 @@ function createServerHarness(t, { enabled = false } = {}) {
         if (name === './reminder-telegram') return { sendTelegramReminder: (token, id, text) => require('../reminder-telegram').sendTelegramReminder(token, id, text, request) };
         if (name === './telegram-linking') return require('../telegram-linking');
         if (name === './order-store') return require('../order-store');
+        if (name === './stripe-checkout') return require('../stripe-checkout');
         if (name === 'nodemailer') return { createTransport: () => ({ sendMail: async options => {
           email.push(options);
           if (h.failEmail) throw new Error('SMTP fake failure');
