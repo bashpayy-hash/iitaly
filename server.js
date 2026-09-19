@@ -9,6 +9,7 @@ const { createReminderRunner, RETRY_MS } = require("./reminders");
 const { sendTelegramReminder } = require("./reminder-telegram");
 const { makeLinkToken, findClientByToken } = require("./telegram-linking");
 const { createOrderStore } = require("./order-store");
+const { CURRENCY: STRIPE_CURRENCY, minorUnits, createCheckoutSession, parseVerifiedEvent } = require("./stripe-checkout");
 
 /* ---------- Почта ----------
    Настраивается переменными SMTP_HOST, SMTP_USER, SMTP_PASS, SMTP_FROM.
@@ -88,7 +89,12 @@ app.use((req, res, next) => {
   next();
 });
 
-app.use(express.json({ limit: "8mb" }));
+const jsonParser = express.json({ limit: "8mb" });
+const stripeRawParser = express.raw({ type: "application/json", limit: "1mb" });
+app.use((req, res, next) => {
+  if (req.path === "/api/stripe/webhook") return stripeRawParser(req, res, next);
+  return jsonParser(req, res, next);
+});
 
 // Ошибки разбора тела отдаём как JSON, а не HTML-страницей
 app.use((err, req, res, next) => {
@@ -386,6 +392,7 @@ app.get("/health", (_req, res) => {
     ok,
     storage: storageReady ? "ready" : "unavailable",
     telegramConfigured: Boolean(process.env.TG_BOT_TOKEN && process.env.TG_WEBHOOK_SECRET),
+    stripeConfigured: Boolean(process.env.STRIPE_SECRET_KEY && process.env.STRIPE_WEBHOOK_SECRET),
     remindersEnabled: process.env.REMINDERS !== "off",
   });
 });
@@ -1073,6 +1080,54 @@ app.post("/api/lead", orderLimit, async (req, res) => {
     res.status(500).json({ ok: false });
   }
 });
+
+const PRODUCT_CATALOG = new Map([
+  ["Поступление под ключ", { price: 25000, fulfillment: "portal" }],
+  ["Срочная проверка · 1 документ", { price: 16900, fulfillment: "manual" }],
+]);
+
+function productOffer(name) {
+  return PRODUCT_CATALOG.get(String(name || "")) || null;
+}
+
+function makeOrderToken() {
+  const token = crypto.randomBytes(32).toString("base64url");
+  return { token, hash: crypto.createHash("sha256").update(token).digest("hex") };
+}
+
+function orderTokenMatches(order, token) {
+  if (!order || !order.accessTokenHash || typeof token !== "string") return false;
+  const expected = Buffer.from(String(order.accessTokenHash), "hex");
+  const actual = Buffer.from(crypto.createHash("sha256").update(token).digest("hex"), "hex");
+  return expected.length === actual.length && crypto.timingSafeEqual(expected, actual);
+}
+
+function activatePortalOrder(order) {
+  if (!order || order.fulfillment !== "portal") return { ok: false, error: "not_portal" };
+  const existing = order.portalCode ? readClient(order.portalCode) : findClientByOrderId(order.id);
+  if (existing) {
+    order.portalCode = existing.code;
+    order.status = "activated";
+    order.activatedAt = order.activatedAt || existing.createdAt;
+    order.updatedAt = new Date().toISOString();
+    orderStore.write(order);
+    return { ok: true, code: existing.code, data: existing, alreadyActivated: true };
+  }
+  if (String(order.surname || "").trim().length < 2) return { ok: false, error: "surname" };
+  const created = createPortalClient({
+    name: order.name,
+    surname: order.surname,
+    phone: order.phone,
+    sourceOrderId: order.id,
+  });
+  if (!created.ok) return created;
+  order.portalCode = created.code;
+  order.status = "activated";
+  order.activatedAt = new Date().toISOString();
+  order.updatedAt = order.activatedAt;
+  if (!orderStore.write(order)) return { ok: false, error: "order_write" };
+  return { ok: true, code: created.code, data: created.data, alreadyActivated: false };
+}
 
 // --- Приём заказов ---
 app.post("/api/order", orderLimit, async (req, res) => {
