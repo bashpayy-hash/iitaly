@@ -1,4 +1,4 @@
-// IItaly — прокси для ИИ-чата (production-ready)
+// IITALY — прокси для ИИ-чата (production-ready)
 // Запуск локально: ANTHROPIC_API_KEY=sk-... node server.js
 // Деплой: Railway / Render — ключ в env-переменной ANTHROPIC_API_KEY
 
@@ -8,6 +8,7 @@ const { buildRoadmap, defaultIntakeYear } = require("./roadmap");
 const { createReminderRunner, RETRY_MS } = require("./reminders");
 const { sendTelegramReminder } = require("./reminder-telegram");
 const { makeLinkToken, findClientByToken } = require("./telegram-linking");
+const { createOrderStore } = require("./order-store");
 
 /* ---------- Почта ----------
    Настраивается переменными SMTP_HOST, SMTP_USER, SMTP_PASS, SMTP_FROM.
@@ -34,7 +35,7 @@ async function sendMail(to, subject, text) {
   if (!mailer || !to) return false;
   try {
     const info = await mailer.sendMail({
-      from: process.env.SMTP_FROM || ("IItaly <" + process.env.SMTP_USER + ">"),
+      from: process.env.SMTP_FROM || ("IITALY <" + process.env.SMTP_USER + ">"),
       to, subject, text,
     });
     // SMTP acceptance for THIS recipient, not just a resolved promise.
@@ -75,7 +76,7 @@ app.use((req, res, next) => {
     res.header("Vary", "Origin");   // иначе CDN отдаст чужому сайту чужой заголовок
   }
   res.header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-  res.header("Access-Control-Allow-Headers", "Content-Type");
+  res.header("Access-Control-Allow-Headers", "Content-Type, Authorization");
   res.header("Access-Control-Max-Age", "86400");
   if (req.method === "OPTIONS") return res.sendStatus(204);   // preflight
   next();
@@ -182,6 +183,7 @@ function writeClient(code, data) {
 const EVENTS_LOG = STORE_DIR + "/events.log";
 const LEADS_LOG = STORE_DIR + "/leads.log";
 const ORDERS_LOG = STORE_DIR + "/orders.log";
+const orderStore = createOrderStore({ dir: STORE_DIR, key: DATA_KEY });
 
 /* Разовый перенос старых логов из образа на том. Без него после деплоя
    статистика начнётся с нуля, хотя данные за прошлый период существуют.
@@ -324,7 +326,21 @@ setInterval(() => {
 }, WINDOW_MS);
 
 // --- Health check для Railway/Render ---
-app.get("/health", (_req, res) => res.json({ ok: true }));
+app.get("/health", (_req, res) => {
+  let storageReady = false;
+  try {
+    fs.accessSync(STORE_DIR, fs.constants.R_OK | fs.constants.W_OK);
+    fs.accessSync(STORE_DIR + "/clients", fs.constants.R_OK | fs.constants.W_OK);
+    storageReady = STORE_DIR === DATA_DIR;
+  } catch {}
+  const ok = storageReady;
+  res.status(ok ? 200 : 503).json({
+    ok,
+    storage: storageReady ? "ready" : "unavailable",
+    telegramConfigured: Boolean(process.env.TG_BOT_TOKEN && process.env.TG_WEBHOOK_SECRET),
+    remindersEnabled: process.env.REMINDERS !== "off",
+  });
+});
 
 // --- Основной эндпоинт чата ---
 app.post("/api/chat", rateLimit, async (req, res) => {
@@ -1014,7 +1030,7 @@ app.post("/api/lead", orderLimit, async (req, res) => {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           chat_id: chat,
-          text: `👤 Новый лид IItaly\n${clean(education)} → ${clean(goal)}\nБюджет: ${clean(budget)}\nТел: ${clean(phone)}`,
+          text: `👤 Новый лид IITALY\n${clean(education)} → ${clean(goal)}\nБюджет: ${clean(budget)}\nТел: ${clean(phone)}`,
         }),
       }).catch(() => {});
     }
@@ -1046,7 +1062,7 @@ app.post("/api/order", orderLimit, async (req, res) => {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           chat_id: chat,
-          text: `🛒 Новый заказ IItaly\n${product} — ${price || "?"} ₸\n${name}, ${phone}`,
+          text: `🛒 Новый заказ IITALY\n${product} — ${price || "?"} ₸\n${name}, ${phone}`,
         }),
       }).catch((e) => console.error("tg notify failed:", e.message));
     }
@@ -1100,4 +1116,4 @@ const PORT = process.env.PORT || 3000;
   if (!miss.length) console.log("Настройки в порядке");
 })();
 
-app.listen(PORT, () => console.log(`IItaly proxy up on :${PORT}`));
+app.listen(PORT, () => console.log(`IITALY proxy up on :${PORT}`));
