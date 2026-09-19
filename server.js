@@ -1351,6 +1351,8 @@ app.get("/api/admin/overview", adminAuth, (_req, res) => {
     phone: order.phone,
     portalCode: order.portalCode || null,
     activatedAt: order.activatedAt || null,
+    provider: order.provider || "manual",
+    fulfillment: order.fulfillment || productOffer(order.product)?.fulfillment || "manual",
   }));
   res.json({
     ok: true,
@@ -1365,47 +1367,31 @@ app.post("/api/admin/orders/:id/confirm", adminAuth, async (req, res) => {
   const order = orderStore.read(String(req.params.id || ""));
   if (!order) return res.status(404).json({ ok: false, error: "Заказ не найден" });
 
-  let existing = order.portalCode ? readClient(order.portalCode) : findClientByOrderId(order.id);
-  if (existing) {
-    if (!order.portalCode) {
-      order.portalCode = existing.code;
-      order.status = "activated";
-      order.activatedAt = order.activatedAt || existing.createdAt;
-      order.updatedAt = new Date().toISOString();
-      orderStore.write(order);
-    }
-    return res.json({ ok: true, code: existing.code, name: existing.name, surname: existing.surname, phone: order.phone, alreadyActivated: true });
+  const offer = productOffer(order.product);
+  order.fulfillment = order.fulfillment || offer?.fulfillment || "manual";
+  if (order.fulfillment !== "portal") {
+    order.status = "paid";
+    order.paidAt = order.paidAt || new Date().toISOString();
+    order.updatedAt = new Date().toISOString();
+    if (!orderStore.write(order)) return res.status(500).json({ ok: false, error: "Не удалось сохранить статус" });
+    return res.json({ ok: true, manual: true, phone: order.phone, alreadyActivated: false });
   }
 
-  const surname = String(order.surname || req.body?.surname || "").trim();
-  if (surname.length < 2) return res.status(400).json({ ok: false, error: "Для активации нужна фамилия" });
+  if (!order.surname) order.surname = String(req.body?.surname || "").trim();
+  const fulfilled = activatePortalOrder(order);
+  if (!fulfilled.ok) {
+    const status = fulfilled.error === "surname" ? 400 : 500;
+    return res.status(status).json({ ok: false, error: fulfilled.error === "surname" ? "Для активации нужна фамилия" : "Не удалось создать кабинет" });
+  }
 
-  const created = createPortalClient({
-    name: order.name,
-    surname,
+  res.json({
+    ok: true,
+    code: fulfilled.code,
+    name: fulfilled.data.name,
+    surname: fulfilled.data.surname,
     phone: order.phone,
-    profile: req.body?.profile && typeof req.body.profile === "object" ? req.body.profile : {},
-    intakeYear: Number(req.body?.intakeYear),
-    sourceOrderId: order.id,
+    alreadyActivated: fulfilled.alreadyActivated,
   });
-  if (!created.ok) return res.status(500).json({ ok: false, error: "Не удалось создать кабинет" });
-
-  order.surname = surname;
-  order.status = "activated";
-  order.portalCode = created.code;
-  order.activatedAt = new Date().toISOString();
-  order.updatedAt = order.activatedAt;
-  if (!orderStore.write(order)) return res.status(500).json({ ok: false, error: "Кабинет создан, но статус заказа не сохранился" });
-
-  const token = process.env.TG_BOT_TOKEN, chat = process.env.TG_CHAT_ID;
-  if (token && chat) {
-    fetch("https://api.telegram.org/bot" + token + "/sendMessage", {
-      method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ chat_id: chat, text: "✅ Оплата подтверждена\n" + order.id + "\nКабинет: " + created.code }),
-    }).catch(() => {});
-  }
-
-  res.json({ ok: true, code: created.code, name: created.data.name, surname: created.data.surname, phone: order.phone, alreadyActivated: false });
 });
 
 app.post("/api/admin/clients/create", adminAuth, async (req, res) => {
@@ -1472,6 +1458,8 @@ const PORT = process.env.PORT || 3000;
     TG_BOT_NAME: "кнопка подключения бота в кабинете",
     SITE_URL: "ссылки в письмах и сообщениях",
     SMTP_HOST: "письма с напоминаниями",
+    STRIPE_SECRET_KEY: "Stripe Checkout",
+    STRIPE_WEBHOOK_SECRET: "проверка Stripe webhook",
   };
   const miss = Object.keys(need).filter((k) => !process.env[k]);
   const missOpt = Object.keys(opt).filter((k) => !process.env[k]);
