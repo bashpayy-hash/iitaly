@@ -9,7 +9,7 @@ function hashToken(token) {
   return createHash('sha256').update(String(token)).digest('hex');
 }
 
-function makeLinkToken(now = Date.now) {
+function makeLinkToken(now = Date.now()) {
   const token = randomBytes(32).toString('base64url');
   return {
     token,
@@ -28,14 +28,14 @@ function sameHash(a, b) {
   return x.length === y.length && timingSafeEqual(x, y);
 }
 
-function validLinkRecord(record, now = Date.now) {
+function validLinkRecord(record, now = Date.now()) {
   if (!record || typeof record !== 'object') return false;
   if (!/^[a-f0-9]{64}$/.test(String(record.hash || ''))) return false;
   const expires = Date.parse(String(record.expiresAt || ''));
   return Number.isFinite(expires) && expires > now;
 }
 
-function findClientByToken(token, listCodes, readClient, now = Date.now) {
+function findClientByToken(token, listCodes, readClient, now = Date.now()) {
   if (!TOKEN_RE.test(String(token || ''))) return null;
   const wanted = hashToken(token);
   for (const code of listCodes()) {
