@@ -39,7 +39,7 @@ async function j(method, path, body) {
   if (r.status === 200) console.log("     ответ ИИ: " + String(r.data?.reply || "").slice(0, 80) + "…");
 
   // 5. order: валидный
-  r = await j("POST", "/api/order", { product: "Гайд по DSU", price: 1990, name: "Тест", phone: "+77071234567" });
+  r = await j("POST", "/api/order", { product: "Поступление под ключ", price: 25000, name: "Тест", surname: "Пользователь", phone: "+77071234567" });
   ok(r.status === 200 && r.data?.ok === true, "POST /api/order валидный → 200");
 
   // 6. order: кривой телефон
