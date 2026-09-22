@@ -11,6 +11,12 @@ function minorUnits(amount) {
   return Math.round(value * 100);
 }
 
+function redactStripeSecrets(value) {
+  return String(value || '')
+    .replace(/\b(?:sk|rk|pk)_(?:live|test)_[A-Za-z0-9]+\b/g, '[REDACTED_STRIPE_KEY]')
+    .replace(/\bwhsec_[A-Za-z0-9]+\b/g, '[REDACTED_WEBHOOK_SECRET]');
+}
+
 async function createCheckoutSession({ secretKey, order, siteUrl, fetchImpl = fetch }) {
   if (!secretKey) return { ok: false, error: 'stripe_not_configured' };
   const base = String(siteUrl || 'https://iitaly.kz').replace(/\/$/, '');
@@ -36,12 +42,22 @@ async function createCheckoutSession({ secretKey, order, siteUrl, fetchImpl = fe
       },
       body: body.toString(),
     });
-  } catch {
+  } catch (error) {
+    console.error('STRIPE CHECKOUT NETWORK ERROR:', error?.name || 'unknown');
     return { ok: false, error: 'stripe_network' };
   }
 
   const data = await response.json().catch(() => null);
   if (!response.ok || !data || typeof data.id !== 'string' || typeof data.url !== 'string') {
+    const stripeError = data && typeof data === 'object' ? data.error : null;
+    console.error('STRIPE CHECKOUT API ERROR:', JSON.stringify({
+      status: response.status,
+      type: stripeError?.type || null,
+      code: stripeError?.code || null,
+      param: stripeError?.param || null,
+      message: redactStripeSecrets(stripeError?.message || ''),
+      requestId: response.headers?.get?.('request-id') || null,
+    }));
     return { ok: false, error: 'stripe_api' };
   }
   return { ok: true, id: data.id, url: data.url };
