@@ -1084,7 +1084,6 @@ app.post("/api/lead", orderLimit, async (req, res) => {
 const PRODUCT_CATALOG = new Map([
   ["Поступление под ключ", { price: 25000, fulfillment: "portal" }],
   ["Срочная проверка · 1 документ", { price: 16900, fulfillment: "manual" }],
-  ["IITALY Launch Test 500 X7K4M9", { price: 500, fulfillment: "portal" }],
 ]);
 
 function productOffer(name) {
