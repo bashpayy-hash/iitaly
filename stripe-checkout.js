@@ -22,6 +22,7 @@ async function createCheckoutSession({ secretKey, order, siteUrl, fetchImpl = fe
   const base = String(siteUrl || 'https://iitaly.kz').replace(/\/$/, '');
   const body = new URLSearchParams();
   body.set('mode', 'payment');
+  body.set('managed_payments[enabled]', 'false');
   body.set('success_url', base + '/payment/success');
   body.set('cancel_url', base + '/prices?payment=cancelled');
   body.set('client_reference_id', order.id);
