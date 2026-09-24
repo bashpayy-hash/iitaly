@@ -4,7 +4,7 @@
 
 const express = require("express");
 const fs = require("fs");
-const { buildRoadmap, defaultIntakeYear } = require("./roadmap");
+const { buildRoadmap, defaultIntakeYear, profileReady, needsTwelveYears } = require("./roadmap");
 const { createReminderRunner, RETRY_MS } = require("./reminders");
 const { sendTelegramReminder } = require("./reminder-telegram");
 const { makeLinkToken, findClientByToken } = require("./telegram-linking");
@@ -634,9 +634,41 @@ function normSurname(v) {
    в логи, которые мы не контролируем. В теле POST этого не происходит.
    Старый GET не удалён намеренно: фронтенд и бэкенд выкатываются
    порознь, и на время рассинхрона сайт должен продолжать работать. */
+function portalPayload(c) {
+  const roadmap = buildRoadmap(null, c.profile, c.intakeYear);
+  let total = 0, done = 0;
+  for (const st of roadmap) for (const t of st.tasks) { total++; if (c.done[t.id]) done++; }
+
+  const p = c.profile || {};
+  const onboardingComplete = Boolean(
+    p.onboardingDone &&
+    profileReady(p) &&
+    (!needsTwelveYears(p) || p.educationPath)
+  );
+
+  return {
+    ok: true,
+    client: {
+      name: c.name,
+      surname: c.surname,
+      intakeYear: c.intakeYear,
+      createdAt: c.createdAt,
+      email: c.email || "",
+      tgLinked: !!c.tgChatId,
+      notify: c.notify || { email: true, telegram: true },
+      botName: process.env.TG_BOT_NAME || "",
+      profile: p,
+      onboardingComplete,
+    },
+    roadmap,
+    done: c.done,
+    docs: c.docs || {},
+    progress: { done, total, pct: total ? Math.round((done / total) * 100) : 0 },
+  };
+}
+
 function readPortal(req, res, code, surname) {
   const c = readClient(code);
-  // одинаковый ответ на неверный код и неверную фамилию: не подсказываем, что именно не так
   const deny = () => {
     noteLoginFail(req);
     return res.status(404).json({ ok: false, error: "Не нашли бронь. Проверь фамилию и код." });
@@ -647,23 +679,7 @@ function readPortal(req, res, code, surname) {
   if (!c) return deny();
   if (normSurname(surname) !== normSurname(c.surname)) return deny();
 
-  const roadmap = buildRoadmap(null, c.profile, c.intakeYear);
-  let total = 0, done = 0;
-  for (const st of roadmap) for (const t of st.tasks) { total++; if (c.done[t.id]) done++; }
-
-  res.json({
-    ok: true,
-    client: {
-      name: c.name, surname: c.surname, intakeYear: c.intakeYear, createdAt: c.createdAt,
-      email: c.email || "", tgLinked: !!c.tgChatId,
-      notify: c.notify || { email: true, telegram: true },
-      botName: process.env.TG_BOT_NAME || "",
-    },
-    roadmap,
-    done: c.done,
-    docs: c.docs || {},
-    progress: { done, total, pct: total ? Math.round((done / total) * 100) : 0 },
-  });
+  res.json(portalPayload(c));
 }
 
 app.post("/api/portal/lookup", portalLimit, (req, res) => {
@@ -675,6 +691,66 @@ app.post("/api/portal/lookup", portalLimit, (req, res) => {
 app.get("/api/portal/:code", portalLimit, (req, res) => {
   const code = String(req.params.code || "").toUpperCase().slice(0, 12);
   readPortal(req, res, code, req.query.surname);
+});
+
+const PROFILE_VALUES = {
+  education: new Set(["11 классов", "НИШ / 12 лет", "Студент вуза КЗ", "Бакалавр"]),
+  goal: new Set(["Бакалавриат", "Магистратура"]),
+  budget: new Set(["Только со стипендией", "До 1 млн ₸/год", "До 3 млн ₸/год", "Без ограничений"]),
+  educationPath: new Set(["university_kz", "foundation"]),
+};
+
+// Первый вход в кабинет сохраняет только данные, которые реально меняют маршрут.
+// Профиль и развилка 12 лет закрываются автоматически — пользователь не ставит
+// галочку там, где система сама знает состояние.
+app.post("/api/portal/:code/profile", portalLimit, (req, res) => {
+  const code = String(req.params.code || "").toUpperCase().slice(0, 12);
+  const c = readClient(code);
+  if (!c) return res.status(404).json({ ok: false, error: "Не нашли бронь" });
+  if (normSurname(req.body && req.body.surname) !== normSurname(c.surname)) {
+    return res.status(403).json({ ok: false, error: "Нет доступа" });
+  }
+
+  const body = req.body || {};
+  const p = c.profile = c.profile || {};
+
+  for (const key of ["education", "goal", "budget"]) {
+    if (body[key] !== undefined) {
+      if (typeof body[key] !== "string" || !PROFILE_VALUES[key].has(body[key])) {
+        return res.status(400).json({ ok: false, error: "Проверь ответы профиля" });
+      }
+      p[key] = body[key];
+    }
+  }
+
+  if (body.educationPath !== undefined) {
+    if (body.educationPath !== null &&
+        (typeof body.educationPath !== "string" || !PROFILE_VALUES.educationPath.has(body.educationPath))) {
+      return res.status(400).json({ ok: false, error: "Проверь путь 12 лет образования" });
+    }
+    if (body.educationPath) p.educationPath = body.educationPath;
+    else delete p.educationPath;
+  }
+
+  if (typeof body.onboardingDone === "boolean") p.onboardingDone = body.onboardingDone;
+
+  c.done = c.done || {};
+  const now = new Date().toISOString();
+  if (profileReady(p)) c.done.profile = c.done.profile || now;
+  else delete c.done.profile;
+
+  if (!needsTwelveYears(p)) {
+    c.done.path12 = c.done.path12 || now;
+    delete p.educationPath;
+  } else if (p.educationPath) {
+    c.done.path12 = c.done.path12 || now;
+  } else {
+    delete c.done.path12;
+  }
+
+  c.updatedAt = now;
+  if (!writeClient(code, c)) return res.status(500).json({ ok: false, error: "Не удалось сохранить профиль" });
+  res.json(portalPayload(c));
 });
 
 // Отметить задачу выполненной или снять отметку
@@ -689,6 +765,9 @@ app.post("/api/portal/:code/task", portalLimit, (req, res) => {
   const { task, value } = req.body || {};
   if (typeof task !== "string" || !/^[a-zA-Z0-9_]{2,30}$/.test(task)) {
     return res.status(400).json({ ok: false, error: "Некорректная задача" });
+  }
+  if (task === "profile" || task === "path12") {
+    return res.status(409).json({ ok: false, error: "Этот шаг обновляется автоматически из профиля." });
   }
   if (value) c.done[task] = new Date().toISOString(); else delete c.done[task];
   c.updatedAt = new Date().toISOString();
