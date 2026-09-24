@@ -734,6 +734,10 @@ app.post("/api/portal/:code/profile", portalLimit, (req, res) => {
 
   if (typeof body.onboardingDone === "boolean") p.onboardingDone = body.onboardingDone;
 
+  // Если человек уже учится в вузе Казахстана, путь 12-го года уже выбран
+  // фактом обучения — не заставляем отвечать на тот же вопрос второй раз.
+  if (p.education === "Студент вуза КЗ") p.educationPath = "university_kz";
+
   c.done = c.done || {};
   const now = new Date().toISOString();
   if (profileReady(p)) c.done.profile = c.done.profile || now;
