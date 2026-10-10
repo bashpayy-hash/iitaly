@@ -487,6 +487,42 @@ const MAX_B64 = 7_500_000;   // ~5.6 МБ файла — предел Anthropic 
    проверки. */
 const ANSWER_TOKENS = 4000;
 
+/* Почему Anthropic отказал — словами, по которым понятно, что делать.
+
+   Раньше на любой не-2xx ответ человек видел «Сервис проверки временно
+   недоступен. Попробуй через минуту.» Это верно только для перегрузки и
+   лимитов. Кончился баланс, отозван ключ, в ANTHROPIC_MODEL опечатка —
+   ждать бесполезно, а сообщение обещало, что через минуту заработает, и
+   по скриншоту было не понять, какая из бед случилась.
+
+   Код в скобках нужен владельцу сайта, а не посетителю: по скриншоту
+   сразу видно, куда идти — в биллинг, в ключи или в переменные Railway.
+   Текст ошибки Anthropic наружу не отдаём, он остаётся в логе. */
+function checkFailure(status, bodyText) {
+  let type = "", message = "";
+  try {
+    const parsed = JSON.parse(bodyText);
+    type = (parsed && parsed.error && parsed.error.type) || "";
+    message = (parsed && parsed.error && parsed.error.message) || "";
+  } catch {}
+
+  if (status === 429 || status === 500 || status === 529 || type === "overloaded_error" || type === "api_error" || type === "rate_limit_error") {
+    return "Сервис проверки перегружен. Попробуй через минуту.";
+  }
+  if (status === 413 || type === "request_too_large") {
+    return "Файл слишком большой для проверки. Пришли страницы по отдельности.";
+  }
+  const ours = "Проверка документов сейчас не работает по нашей вине. Попробуй позже или задай вопрос в чате.";
+  if (status === 402 || type === "billing_error" || /credit balance/i.test(message)) return ours + " (код: баланс API)";
+  if (status === 401 || type === "authentication_error") return ours + " (код: ключ API)";
+  if (status === 403 || type === "permission_error") return ours + " (код: доступ API)";
+  if (status === 404 || type === "not_found_error") return ours + " (код: модель " + MODEL + ")";
+  if (/image|media.?type|pdf|document/i.test(message)) {
+    return "Не получилось прочитать файл. Пришли PDF или фото в JPG или PNG.";
+  }
+  return ours + " (код " + status + ")";
+}
+
 app.post("/api/check-document", heavyLimit, async (req, res) => {
   try {
     if (!CHECK_PROMPT) return res.status(503).json({ ok: false, error: "Проверка документов временно недоступна." });
@@ -544,8 +580,9 @@ app.post("/api/check-document", heavyLimit, async (req, res) => {
     });
 
     if (!r.ok) {
-      console.error("Anthropic error (check-document):", r.status, await r.text().catch(() => ""));
-      return res.status(502).json({ ok: false, error: "Сервис проверки временно недоступен. Попробуй через минуту." });
+      const errText = await r.text().catch(() => "");
+      console.error("Anthropic error (check-document):", r.status, errText.slice(0, 600));
+      return res.status(502).json({ ok: false, error: checkFailure(r.status, errText) });
     }
 
     const data = await r.json();
