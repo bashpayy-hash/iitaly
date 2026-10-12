@@ -20,6 +20,15 @@ test('missing/malformed key never makes a provider request', async () => {
   }
 });
 
+test('malformed workspace ID cannot enter provider headers', async () => {
+  for (const workspaceId of ['Default', 'wrkspc_invalid\r\nheader:value', 'wrkspc_']) {
+    const ai = createAiReadiness({ apiKey: 'synthetic-key', model: 'test-model', workspaceId,
+      request: () => assert.fail('Invalid workspace must not reach the provider') });
+    assert.equal((await ai.check()).code, 'AI_WORKSPACE_INVALID');
+    assert.equal(ai.snapshot().retryable, false);
+  }
+});
+
 test('401 is cached, concurrent probes coalesce, and recovery is checked after TTL', async () => {
   let calls = 0, time = 1000, status = 401;
   const ai = createAiReadiness({ apiKey: 'synthetic-key', model: 'test-model', now: () => time,
@@ -70,6 +79,7 @@ test('metadata failures distinguish billing, workspace, request and rate limits 
     [400, 'invalid_request_error', 'Your credit balance is too low. ' + privateValue, 'AI_BILLING_REQUIRED', false],
     [402, 'billing_error', privateValue, 'AI_BILLING_REQUIRED', false],
     [400, 'invalid_request_error', 'Missing anthropic-workspace-id. ' + privateValue, 'AI_WORKSPACE_REQUIRED', false],
+    [404, 'not_found_error', 'Workspace `' + privateValue + '` not found.', 'AI_WORKSPACE_UNAVAILABLE', false],
     [400, 'invalid_request_error', privateValue, 'AI_REQUEST_INVALID', false],
     [429, 'rate_limit_error', privateValue, 'AI_RATE_LIMITED', true],
     [503, 'api_error', privateValue, 'AI_PROVIDER_UNAVAILABLE', true],

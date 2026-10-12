@@ -4,7 +4,7 @@
 
 const express = require("express");
 const fs = require("fs");
-const { normalizeApiKey, createAiReadiness } = require("./ai-readiness");
+const { normalizeApiKey, anthropicHeaders, createAiReadiness } = require("./ai-readiness");
 const { buildRoadmap, defaultIntakeYear, profileReady, needsTwelveYears } = require("./roadmap");
 const { createReminderRunner, RETRY_MS } = require("./reminders");
 const { sendTelegramReminder } = require("./reminder-telegram");
@@ -281,8 +281,10 @@ try {
    и при смене поколения её приходилось искать по коду. */
 const MODEL = process.env.ANTHROPIC_MODEL || "claude-sonnet-4-6";
 const API_KEY = normalizeApiKey(process.env.ANTHROPIC_API_KEY);
+const AI_WORKSPACE_ID = normalizeApiKey(process.env.ANTHROPIC_WORKSPACE_ID);
+const AI_HEADERS = anthropicHeaders(API_KEY, AI_WORKSPACE_ID);
 if (!API_KEY) console.warn("WARN: ANTHROPIC_API_KEY не задан — чат не будет работать");
-const aiReadiness = createAiReadiness({ apiKey: API_KEY, model: MODEL,
+const aiReadiness = createAiReadiness({ apiKey: API_KEY, model: MODEL, workspaceId: AI_WORKSPACE_ID,
   request: (url, options) => fetchWithTimeout(url, options, 8000),
   onChange: state => console.log("AI readiness: " + JSON.stringify(state)),
 });
@@ -456,8 +458,7 @@ app.post("/api/chat", rateLimit, async (req, res) => {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        "x-api-key": API_KEY,
-        "anthropic-version": "2023-06-01",
+        ...AI_HEADERS,
       },
       body: JSON.stringify({
         model: MODEL,
@@ -589,8 +590,7 @@ app.post("/api/check-document", heavyLimit, async (req, res) => {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        "x-api-key": API_KEY,
-        "anthropic-version": "2023-06-01",
+        ...AI_HEADERS,
       },
       body: JSON.stringify({
         model: MODEL,
