@@ -5,6 +5,7 @@
 const express = require("express");
 const fs = require("fs");
 const { normalizeApiKey, anthropicHeaders, createAiReadiness } = require("./ai-readiness");
+const { buildDocumentReviewContext, documentContextPrompt } = require("./document-review-context");
 const { buildRoadmap, defaultIntakeYear, profileReady, needsTwelveYears } = require("./roadmap");
 const { createReminderRunner, RETRY_MS } = require("./reminders");
 const { sendTelegramReminder } = require("./reminder-telegram");
@@ -546,7 +547,8 @@ function checkFailure(status, bodyText) {
 app.post("/api/check-document", heavyLimit, async (req, res) => {
   try {
     if (!CHECK_PROMPT) return res.status(503).json({ ok: false, error: "Проверка документов временно недоступна." });
-    const { image, pdf, mediaType, hint, text, fileName } = req.body || {};
+    const { image, pdf, mediaType, hint, text, fileName, context } = req.body || {};
+    const review = buildDocumentReviewContext(context);
     const hintText = "Проверь этот документ."
       + (typeof fileName === "string" && fileName ? " Имя файла: " + fileName.slice(0, 80) + "." : "")
       + (typeof hint === "string" && hint ? " Пользователь считает, что это: " + hint.slice(0, 100) : "");
@@ -595,7 +597,7 @@ app.post("/api/check-document", heavyLimit, async (req, res) => {
       body: JSON.stringify({
         model: MODEL,
         max_tokens: ANSWER_TOKENS,
-        system: CHECK_PROMPT,
+        system: CHECK_PROMPT + documentContextPrompt(review),
         messages: [{ role: "user", content }],
       }),
     });
@@ -619,7 +621,7 @@ app.post("/api/check-document", heavyLimit, async (req, res) => {
       const m = cleaned.match(/\{[\s\S]*\}/);
       if (m) { try { parsed = JSON.parse(m[0]); } catch {} }
     }
-    if (!parsed) {
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
       /* Диагностика формы ответа — БЕЗ единого символа самого ответа.
          Раньше здесь была одна строка «не удалось разобрать ответ
          модели», и по ней нельзя было отличить обрезанный ответ от
@@ -657,7 +659,7 @@ app.post("/api/check-document", heavyLimit, async (req, res) => {
       }
       return res.status(502).json({ ok: false, error: "Не удалось разобрать результат проверки. Попробуй ещё раз." });
     }
-    res.json({ ok: true, result: parsed });
+    res.json({ ok: true, result: { ...parsed, review } });
   } catch (e) {
     console.error("check-document error:", e.message);
     res.status(500).json({ ok: false, error: "Внутренняя ошибка сервера." });

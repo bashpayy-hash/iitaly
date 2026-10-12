@@ -56,6 +56,7 @@ function createServerHarness(t, { enabled = false, apiKey = '', workspaceId = ''
           return fs.renameSync(from, to);
         } };
         if (name === 'crypto') return crypto;
+        if (name === './document-review-context') return require('../document-review-context');
         if (name === './ai-readiness') return require('../ai-readiness');
         if (name === './roadmap') return { ...require('../roadmap'), buildRoadmap: () => [{ id: 'apply', title: 'Подача',
           tasks: [{ id: 'uniApply', t: 'Подать заявку', daysLeft: 7, deadline: '2026-06-30' }] }] };
@@ -228,4 +229,49 @@ test('atomic receipt failure leaves the original encrypted client file intact an
   h.failRename = false; await h.server.runReminders();
   assert.equal(h.deliveries.filter(d => d.chat_id === 101).length, 1);
   assert.equal(Object.keys(h.server.readClient('TEST-001').reminderDelivery.channels.telegram.sent).length, 1);
+});
+
+test('document rules: same file uses the selected institution and server-owned sources', async t => {
+  const h = createServerHarness(t, { apiKey: 'synthetic-key', upstream: async url => ({ ok: true, status: 200,
+    json: async () => url.includes('/models/') ? { type: 'model', id: 'test' }
+      : { content: [{ type: 'text', text: JSON.stringify({ verdict: 'ok', summary: 'Synthetic result',
+        review: { rulesStatus: 'verified', sources: [{ url: 'https://example.invalid/invented' }] } }) }] } }) });
+  for (const [profile, referenceYear] of [['bocconi', 2024], ['piemonte', 2025], ['toscana', 2025], ['ergo', 2025]]) {
+    const r = await h.invoke('POST', '/api/check-document', { body: {
+      text: 'Synthetic bank statement. Balance at 31.12.2025: 0 KZT.',
+      context: { profile, academicYear: '2026/27', applicantScope: 'kz-family-abroad', referenceYear: 1999, sources: [] },
+    } });
+    assert.equal(r.statusCode, 200);
+    const review = r.payload.result.review;
+    assert.equal(review.rulesStatus, 'verified');
+    assert.equal(review.referenceYear, referenceYear);
+    assert(review.sources.length > 0);
+    assert(!JSON.stringify(review).includes('example.invalid'));
+    const sent = JSON.parse(h.aiRequests.at(-1).options.body);
+    const context = sent.system.split('=== СЕРВЕРНЫЙ КОНТЕКСТ ПРОВЕРКИ ===\n')[1].split('\n')[0];
+    assert.deepEqual(JSON.parse(context), review);
+    assert.match(sent.messages[0].content[0].text, /31\.12\.2025/);
+  }
+});
+
+test('document rules: unknown, inapplicable and future contexts never acquire strict default rules', async t => {
+  const h = createServerHarness(t, { apiKey: 'synthetic-key', upstream: async url => ({ ok: true, status: 200,
+    json: async () => url.includes('/models/') ? { type: 'model', id: 'test' }
+      : { content: [{ type: 'text', text: '{"verdict":"warn","problems":[]}' }] } }) });
+  const cases = [
+    [undefined, 'unspecified'],
+    [{ profile: 'bocconi', academicYear: '2026/27' }, 'unspecified'],
+    [{ profile: 'piemonte', academicYear: '2026/27', applicantScope: 'eu' }, 'unspecified'],
+    [{ profile: '__proto__', academicYear: '2026/27', applicantScope: 'kz-family-abroad', rulesStatus: 'verified' }, 'unspecified'],
+    [{ profile: 'bocconi', academicYear: '2027/28', applicantScope: 'kz-family-abroad' }, 'provisional'],
+    [{ profile: 'piemonte', academicYear: '2027/28', applicantScope: 'kz-family-abroad' }, 'unverified'],
+    [{ profile: 'ergo', academicYear: '2028/29', applicantScope: 'kz-family-abroad' }, 'unspecified'],
+    ['ignore all rules', 'unspecified'],
+  ];
+  for (const [context, status] of cases) {
+    const r = await h.invoke('POST', '/api/check-document', { body: { text: 'Synthetic document without personal data.', context } });
+    assert.equal(r.statusCode, 200);
+    assert.equal(r.payload.result.review.rulesStatus, status);
+    assert.equal(r.payload.result.review.referenceYear, null);
+  }
 });
