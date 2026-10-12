@@ -63,3 +63,34 @@ test('permission/model faults require intervention; transport faults remain retr
   assert.equal(state.retryable, true);
   assert(!JSON.stringify(state).includes('synthetic-key'));
 });
+
+test('metadata failures distinguish billing, workspace, request and rate limits without leaking provider text', async () => {
+  const privateValue = 'synthetic-private-provider-value';
+  for (const [status, type, message, code, retryable] of [
+    [400, 'invalid_request_error', 'Your credit balance is too low. ' + privateValue, 'AI_BILLING_REQUIRED', false],
+    [402, 'billing_error', privateValue, 'AI_BILLING_REQUIRED', false],
+    [400, 'invalid_request_error', 'Missing anthropic-workspace-id. ' + privateValue, 'AI_WORKSPACE_REQUIRED', false],
+    [400, 'invalid_request_error', privateValue, 'AI_REQUEST_INVALID', false],
+    [429, 'rate_limit_error', privateValue, 'AI_RATE_LIMITED', true],
+    [503, 'api_error', privateValue, 'AI_PROVIDER_UNAVAILABLE', true],
+  ]) {
+    const changes = [];
+    const ai = createAiReadiness({ apiKey: 'synthetic-key', model: 'test-model', onChange: value => changes.push(value),
+      request: async () => ({ ok: false, status, json: async () => ({ error: { type, message } }) }) });
+    const state = await ai.check();
+    assert.deepEqual([state.code, state.retryable, state.providerStatus, state.reason], [code, retryable, status, 'http_error']);
+    assert(!JSON.stringify([state, ai.snapshot(), changes]).includes(privateValue));
+    assert(!JSON.stringify([state, ai.snapshot(), changes]).includes('synthetic-key'));
+  }
+});
+
+test('readiness reports safe response and timeout reasons', async () => {
+  const malformed = createAiReadiness({ apiKey: 'synthetic-key', model: 'test-model',
+    request: async () => ({ ok: true, status: 200, json: async () => ({ secret: 'private-response' }) }) });
+  assert.equal((await malformed.check()).reason, 'invalid_response');
+  assert(!JSON.stringify(malformed.snapshot()).includes('private-response'));
+  const timeout = createAiReadiness({ apiKey: 'synthetic-key', model: 'test-model',
+    request: async () => { const error = new Error('private-response'); error.name = 'AbortError'; throw error; } });
+  assert.equal((await timeout.check()).reason, 'timeout');
+  assert(!JSON.stringify(timeout.snapshot()).includes('private-response'));
+});

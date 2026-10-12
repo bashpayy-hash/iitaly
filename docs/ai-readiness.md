@@ -21,6 +21,8 @@
 
 При `AI_AUTH_INVALID` нужна проверка ключа; `AI_PERMISSION_DENIED` — прав workspace; `AI_MODEL_UNAVAILABLE` — `ANTHROPIC_MODEL`; `AI_PROVIDER_UNAVAILABLE` — сети или состояния провайдера. Источники: [ошибки Claude API](https://platform.claude.com/docs/en/api/errors), [аутентификация](https://platform.claude.com/docs/en/manage-claude/authentication), [метаданные модели](https://platform.claude.com/docs/en/api/models/retrieve).
 
+Дополнительная диагностика метаданных различает `AI_BILLING_REQUIRED` (баланс API), `AI_WORKSPACE_REQUIRED` (не указан workspace для ключа с доступом к нескольким workspace), `AI_REQUEST_INVALID` (другая ошибка конфигурации запроса) и `AI_RATE_LIMITED` (лимит частоты). Статус содержит только числовой `providerStatus` и фиксированную категорию `reason`: `http_error`, `invalid_response`, `timeout` или `transport_error`. Текст ответа провайдера, ключ и идентификаторы не публикуются и не логируются. Не считать общий `AI_PROVIDER_UNAVAILABLE` подтверждением правильности ключа.
+
 ## Регрессии
 
 `node --test test/*.test.js` проверяет нормализацию, отсутствие передачи секрета в статусах, кэш, параллельные запросы, восстановление, отказ после успешного probe и защиту от устаревшего ответа. Серверные сценарии отдельно подтверждают блокирование чата/документов при 401, работоспособность `/health` и прежний формат успешного результата. CI использует синтетические ответы; его успех не подменяет проверку production.

@@ -16,22 +16,35 @@ const CONFIG_ERRORS = {
 };
 const ADMIN_MESSAGE = 'ИИ-проверка временно отключена: требуется исправление настроек сервиса. Повторная отправка файла не поможет. Гайды доступны без ИИ.';
 
+function probeFailure(status, body) {
+  if (CONFIG_ERRORS[status]) return { code: CONFIG_ERRORS[status], retryable: false };
+  // Classify the metadata response, but never return/log its text or identifiers.
+  const message = typeof body?.error?.message === 'string' ? body.error.message : '';
+  if (status === 402 || body?.error?.type === 'billing_error' || /credit balance/i.test(message)) {
+    return { code: 'AI_BILLING_REQUIRED', retryable: false };
+  }
+  if (status === 400 && /anthropic-workspace-id/i.test(message)) return { code: 'AI_WORKSPACE_REQUIRED', retryable: false };
+  if (status === 400) return { code: 'AI_REQUEST_INVALID', retryable: false };
+  if (status === 429) return { code: 'AI_RATE_LIMITED', retryable: true };
+  return { code: 'AI_PROVIDER_UNAVAILABLE', retryable: true };
+}
+
 function createAiReadiness({ apiKey, model, request, now = Date.now, ttlMs = 60000, onChange = () => {} }) {
   let state = { ok: false, code: 'AI_NOT_CHECKED', retryable: true, checkedAt: null };
   let expires = 0, pending = null, revision = 0;
-  function publish(ok, code, retryable, ttl = ttlMs) {
-    const changed = state.code !== code;
-    state = { ok, code, retryable, checkedAt: new Date(now()).toISOString(),
+  function publish(ok, code, retryable, details = {}) {
+    const changed = state.code !== code || state.providerStatus !== details.providerStatus || state.reason !== details.reason;
+    state = { ok, code, retryable, ...details, checkedAt: new Date(now()).toISOString(),
       ...(ok ? {} : { error: retryable ? 'Не удалось подтвердить доступность ИИ. Проверь доступность ещё раз чуть позже.' : ADMIN_MESSAGE }) };
-    expires = now() + ttl;
-    if (changed) onChange({ ok, code });
+    expires = now() + ttlMs;
+    if (changed) onChange({ ok, code, ...details });
     return { ...state };
   }
   function recordFailure(status) {
     const code = CONFIG_ERRORS[status];
     if (!code) return null;
     revision++;
-    return publish(false, code, false);
+    return publish(false, code, false, { providerStatus: status, reason: 'http_error' });
   }
   async function check() {
     if (expires > now()) return { ...state };
@@ -46,14 +59,19 @@ function createAiReadiness({ apiKey, model, request, now = Date.now, ttlMs = 600
           method: 'GET', headers: { 'x-api-key': apiKey, 'anthropic-version': '2023-06-01' },
         });
         if (revision !== startedAtRevision) return { ...state };
-        if (!response.ok) return publish(false, CONFIG_ERRORS[response.status] || 'AI_PROVIDER_UNAVAILABLE', !CONFIG_ERRORS[response.status]);
+        if (!response.ok) {
+          const body = typeof response.json === 'function' ? await response.json().catch(() => null) : null;
+          if (revision !== startedAtRevision) return { ...state };
+          const failure = probeFailure(response.status, body);
+          return publish(false, failure.code, failure.retryable, { providerStatus: response.status, reason: 'http_error' });
+        }
         const data = await response.json();
         if (revision !== startedAtRevision) return { ...state };
-        if (data?.type !== 'model' || typeof data.id !== 'string') return publish(false, 'AI_PROVIDER_UNAVAILABLE', true);
-        return publish(true, 'AI_READY', true);
-      } catch {
+        if (data?.type !== 'model' || typeof data.id !== 'string') return publish(false, 'AI_PROVIDER_UNAVAILABLE', true, { providerStatus: response.status, reason: 'invalid_response' });
+        return publish(true, 'AI_READY', true, { providerStatus: response.status });
+      } catch (error) {
         if (revision !== startedAtRevision) return { ...state };
-        return publish(false, 'AI_PROVIDER_UNAVAILABLE', true);
+        return publish(false, 'AI_PROVIDER_UNAVAILABLE', true, { reason: error?.name === 'AbortError' ? 'timeout' : 'transport_error' });
       }
     })();
     try { return await pending; } finally { pending = null; }
