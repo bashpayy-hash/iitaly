@@ -1,0 +1,32 @@
+{
+  "version": "2026-10-13",
+  "verifiedOn": "2026-10-13",
+  "sources": {
+    "B26": { "label": "Bocconi · документы ISU 2026/27", "url": "https://www.unibocconi.it/en/current-students/funding/necessary-documentation-isu-bocconi-ay-2026-27" },
+    "BC26": { "label": "Bocconi · ISEEU parificato 2026/27", "url": "https://www.unibocconi.it/en/current-students/funding/iseeu-parificato-certificate-ay-2026-27" },
+    "B27": { "label": "Bocconi · 2027/28, страница обновляется", "url": "https://www.unibocconi.it/en/applying-bocconi/bachelor-and-law-programs/funding/necessary-documentation-isu-bocconi-ay-2027-28" },
+    "P26": { "label": "EDISU Piemonte · bando 2026/27, ст. 30 и приложение E", "url": "https://www.edisu.piemonte.it/sites/default/files/documentazione/bandi-di-concorso/Notice_of_competition_scholarship_accomodation_degree_award_and_contribution_for_students_with_a_disability_of_46_p._or_more_registered_for_targeted_employment_a.y_2026_27_1.pdf" },
+    "T26": { "label": "DSU Toscana · bando 2026/27, ст. 8.3.2 и приложение B", "url": "https://www.dsu.toscana.it/documents/4390857/32478257/bando%2Bborsa%2Balloggio%2B26-27.pdf/092c16da-95e8-1712-b1eb-f159d5e7743e?t=1784280597313" },
+    "T26-D": { "label": "DSU Toscana · семейные и финансовые документы", "url": "https://www.dsu.toscana.it/it/-/documentazione-stato-di-famiglia-redditi-fabbricati-patrimonio-mobiliare-" },
+    "T26-R": { "label": "DSU Toscana · повторная подача иностранных студентов", "url": "https://www.dsu.toscana.it/it/-/studenti-stranieri-italiano" },
+    "E26": { "label": "ER.GO · bando 2026/27, раздел I, п. 2.3.1", "url": "https://www.er-go.it/cosa-fare-per/bandi-di-concorso/leggi-il-bando/bando-di-concorso-benefici-dsu-a-a-2026_2027.pdf/@@display-file/file/bando-di-concorso-benefici-dsu-a-a-2026_2027.pdf" },
+    "M": { "label": "МИД Италии · перевод и легализация", "url": "https://www.esteri.it/it/servizi-opportunita/italiani-all-estero/traduzione-e-legalizzazione-documenti/" },
+    "A": { "label": "Посольство Италии в Астане · заверение переводов", "url": "https://ambastana.esteri.it/it/servizi-consolari-e-visti/servizi-per-il-cittadino-italiano/traduzione-e-legalizzazione-dei-documenti/" },
+    "H": { "label": "Гаагская конвенция · что удостоверяет апостиль", "url": "https://www.hcch.net/en/instruments/conventions/full-text/?cid=41" }
+  },
+  "profiles": {
+    "bocconi": { "label": "Bocconi · ISU / ISEEU", "years": {
+      "2026/27": { "status": "verified", "referenceYear": 2024, "sourceIds": ["B26", "BC26"] },
+      "2027/28": { "status": "provisional", "sourceIds": ["B27"] }
+    } },
+    "piemonte": { "label": "EDISU Piemonte", "years": {
+      "2026/27": { "status": "verified", "referenceYear": 2025, "sourceIds": ["P26"] }
+    } },
+    "toscana": { "label": "DSU Toscana", "years": {
+      "2026/27": { "status": "verified", "referenceYear": 2025, "sourceIds": ["T26", "T26-D", "T26-R"] }
+    } },
+    "ergo": { "label": "ER.GO · Emilia-Romagna", "years": {
+      "2026/27": { "status": "verified", "referenceYear": 2025, "sourceIds": ["E26"] }
+    } }
+  }
+}
