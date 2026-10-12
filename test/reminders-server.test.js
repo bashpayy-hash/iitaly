@@ -13,7 +13,7 @@ const originalServer = fs.readFileSync(path.join(root, 'server.js'), 'utf8');
 // Exercise the actual server wiring, encrypted files and existing handlers.
 // Express routing, timers and network are deliberately intercepted: never use a
 // production secret or a customer's code/chat, and never start a real scheduler.
-function createServerHarness(t, { enabled = false, apiKey = '', upstream } = {}) {
+function createServerHarness(t, { enabled = false, apiKey = '', workspaceId = '', upstream } = {}) {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'iitaly-reminder-test-'));
   t.after(() => fs.rmSync(dataDir, { recursive: true, force: true }));
   const routes = new Map(), intervals = [], timeouts = [], deliveries = [], email = [];
@@ -34,6 +34,7 @@ function createServerHarness(t, { enabled = false, apiKey = '', upstream } = {})
       ? { ok: false, error_code: 500 } : { ok: true, result: { message_id: deliveries.length } } };
   };
   const env = { DATA_DIR: dataDir, DATA_KEY: 'synthetic-test-encryption-key', STATS_KEY: 'synthetic-test-admin-key', ANTHROPIC_API_KEY: apiKey,
+    ANTHROPIC_WORKSPACE_ID: workspaceId,
     TG_BOT_TOKEN: 'fake-token', TG_CHAT_ID: '999', TG_WEBHOOK_SECRET: 'synthetic-test-webhook',
     SMTP_HOST: 'smtp.example.invalid', SMTP_USER: 'example', SMTP_PASS: 'not-a-real-password',
     SITE_URL: 'https://example.invalid', REMINDERS: enabled ? '' : 'off' };
@@ -117,6 +118,20 @@ test('AI readiness: valid metadata and document response retain the result contr
   const r = await h.invoke('POST', '/api/check-document', { body: { text: 'Synthetic document without any personal data.' } });
   assert.equal(r.statusCode, 200); assert.equal(r.payload.result.verdict, 'warn');
   assert.equal(r.payload.result.summary, 'Synthetic result');
+  assert(h.aiRequests.every(r => !('anthropic-workspace-id' in r.options.headers)), 'Scoped keys keep the original header contract');
+});
+
+test('AI workspace selection reaches metadata, chat and document requests', async t => {
+  const h = createServerHarness(t, { apiKey: 'synthetic-key', workspaceId: ' "wrkspc_synthetic123" ', upstream: async (url, options) => {
+    assert.equal(options.headers['anthropic-workspace-id'], 'wrkspc_synthetic123');
+    return { ok: true, status: 200, json: async () => url.includes('/models/') ? { type: 'model', id: 'test' }
+      : { content: [{ type: 'text', text: '{"verdict":"warn","summary":"Synthetic result"}' }] } };
+  } });
+  assert.equal((await h.invoke('GET', '/health/ai')).statusCode, 200);
+  assert.equal((await h.invoke('POST', '/api/check-document', { body: { text: 'Synthetic document without any personal data.' } })).statusCode, 200);
+  assert.equal((await h.invoke('POST', '/api/chat', { body: { messages: [{ role: 'user', content: 'Synthetic check' }] } })).statusCode, 200);
+  assert.equal(h.aiRequests.length, 3);
+  assert(!JSON.stringify((await h.invoke('GET', '/health/ai')).payload).includes('wrkspc_synthetic123'));
 });
 
 test('real wiring: owner/email success does not swallow Telegram JSON failure; restart resumes', async t => {

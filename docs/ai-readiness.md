@@ -14,7 +14,7 @@
 ## Замена ключа
 
 1. В Claude Console создать рабочий API-ключ нужного workspace, проверить его статус и срок действия. Для сервера использовать отдельный управляемый ключ с подходящей политикой ротации.
-2. В Railway: проект `thorough-intuition` → environment `production` → сервис `web` → Variables → заменить **только** `ANTHROPIC_API_KEY`. Секрет вводится в Railway, не в GitHub, исходный код или чат. `DATA_KEY` не менять: он шифрует существующие данные клиентов.
+2. В Railway: проект `thorough-intuition` → environment `production` → сервис `web` → Variables → заменить `ANTHROPIC_API_KEY`. Секрет вводится в Railway, не в GitHub, исходный код или чат. Если ключ не привязан к одному workspace, дополнительно задать `ANTHROPIC_WORKSPACE_ID`: скопировать ID вида `wrkspc_…` из столбца ID в [Settings → Workspaces](https://platform.claude.com/settings/workspaces). Сервер отправит его в `anthropic-workspace-id` для метаданных, чата и документов. При ключе, уже привязанном к workspace, переменная необязательна. `DATA_KEY` не менять: он шифрует существующие данные клиентов.
 3. Применить изменение и дождаться `SUCCESS` нового deployment. Новый процесс перечитает переменную.
 4. Выполнить `BASE=https://web-production-9faf3.up.railway.app node scripts/check-ai-health.js`. Код выхода должен быть 0, статус — `AI_READY`.
 5. На сайте проверить один искусственный TXT/PDF без персональных данных, затем посмотреть, что `/api/check-document` вернул 200 и содержательный `result`. Один только deploy `SUCCESS` не подтверждает доступ к Anthropic.
@@ -22,6 +22,8 @@
 При `AI_AUTH_INVALID` нужна проверка ключа; `AI_PERMISSION_DENIED` — прав workspace; `AI_MODEL_UNAVAILABLE` — `ANTHROPIC_MODEL`; `AI_PROVIDER_UNAVAILABLE` — сети или состояния провайдера. Источники: [ошибки Claude API](https://platform.claude.com/docs/en/api/errors), [аутентификация](https://platform.claude.com/docs/en/manage-claude/authentication), [метаданные модели](https://platform.claude.com/docs/en/api/models/retrieve).
 
 Дополнительная диагностика метаданных различает `AI_BILLING_REQUIRED` (баланс API), `AI_WORKSPACE_REQUIRED` (не указан workspace для ключа с доступом к нескольким workspace), `AI_REQUEST_INVALID` (другая ошибка конфигурации запроса) и `AI_RATE_LIMITED` (лимит частоты). Статус содержит только числовой `providerStatus` и фиксированную категорию `reason`: `http_error`, `invalid_response`, `timeout` или `transport_error`. Текст ответа провайдера, ключ и идентификаторы не публикуются и не логируются. Не считать общий `AI_PROVIDER_UNAVAILABLE` подтверждением правильности ключа.
+
+`AI_WORKSPACE_INVALID` означает неверный формат `ANTHROPIC_WORKSPACE_ID`; такой запрос блокируется до обращения к провайдеру. `AI_WORKSPACE_UNAVAILABLE` означает, что указанный workspace не найден или недоступен ключу. Идентификатор workspace задаётся владельцем, сервер не выбирает случайное пространство из аккаунта.
 
 ## Регрессии
 
