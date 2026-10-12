@@ -118,7 +118,7 @@ test('AI readiness: valid metadata and document response retain the result contr
       : { content: [{ type: 'text', text: '{"verdict":"warn","summary":"Synthetic result"}' }] } }) });
   const r = await h.invoke('POST', '/api/check-document', { body: { text: 'Synthetic document without any personal data.' } });
   assert.equal(r.statusCode, 200); assert.equal(r.payload.result.verdict, 'warn');
-  assert.equal(r.payload.result.summary, 'Synthetic result');
+  assert.match(r.payload.result.summary, /Соответствие требованиям заявки пока не подтверждено/);
   assert(h.aiRequests.every(r => !('anthropic-workspace-id' in r.options.headers)), 'Scoped keys keep the original header contract');
 });
 
@@ -234,7 +234,7 @@ test('atomic receipt failure leaves the original encrypted client file intact an
 test('document rules: same file uses the selected institution and server-owned sources', async t => {
   const h = createServerHarness(t, { apiKey: 'synthetic-key', upstream: async url => ({ ok: true, status: 200,
     json: async () => url.includes('/models/') ? { type: 'model', id: 'test' }
-      : { content: [{ type: 'text', text: JSON.stringify({ verdict: 'ok', summary: 'Synthetic result',
+      : { content: [{ type: 'text', text: JSON.stringify({ docType: 'bank_statement', verdict: 'ok', summary: 'Synthetic result',
         review: { rulesStatus: 'verified', sources: [{ url: 'https://example.invalid/invented' }] } }) }] } }) });
   for (const [profile, referenceYear] of [['bocconi', 2024], ['piemonte', 2025], ['toscana', 2025], ['ergo', 2025]]) {
     const r = await h.invoke('POST', '/api/check-document', { body: {
@@ -257,7 +257,7 @@ test('document rules: same file uses the selected institution and server-owned s
 test('document rules: unknown, inapplicable and future contexts never acquire strict default rules', async t => {
   const h = createServerHarness(t, { apiKey: 'synthetic-key', upstream: async url => ({ ok: true, status: 200,
     json: async () => url.includes('/models/') ? { type: 'model', id: 'test' }
-      : { content: [{ type: 'text', text: '{"verdict":"warn","problems":[]}' }] } }) });
+      : { content: [{ type: 'text', text: '{"docType":"bank_statement","verdict":"warn","problems":[]}' }] } }) });
   const cases = [
     [undefined, 'unspecified'],
     [{ profile: 'bocconi', academicYear: '2026/27' }, 'unspecified'],
