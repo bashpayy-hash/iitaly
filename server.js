@@ -4,6 +4,7 @@
 
 const express = require("express");
 const fs = require("fs");
+const { normalizeApiKey, createAiReadiness } = require("./ai-readiness");
 const { buildRoadmap, defaultIntakeYear, profileReady, needsTwelveYears } = require("./roadmap");
 const { createReminderRunner, RETRY_MS } = require("./reminders");
 const { sendTelegramReminder } = require("./reminder-telegram");
@@ -279,8 +280,12 @@ try {
 /* Модель вынесена в переменную: раньше строка была зашита в двух местах,
    и при смене поколения её приходилось искать по коду. */
 const MODEL = process.env.ANTHROPIC_MODEL || "claude-sonnet-4-6";
-const API_KEY = process.env.ANTHROPIC_API_KEY;
+const API_KEY = normalizeApiKey(process.env.ANTHROPIC_API_KEY);
 if (!API_KEY) console.warn("WARN: ANTHROPIC_API_KEY не задан — чат не будет работать");
+const aiReadiness = createAiReadiness({ apiKey: API_KEY, model: MODEL,
+  request: (url, options) => fetchWithTimeout(url, options, 8000),
+  onChange: state => console.log("AI readiness: " + JSON.stringify(state)),
+});
 
 /* --- Rate limit: отдельная корзина на каждый вид запроса ---
 
@@ -394,7 +399,17 @@ app.get("/health", (_req, res) => {
     telegramConfigured: Boolean(process.env.TG_BOT_TOKEN && process.env.TG_WEBHOOK_SECRET),
     stripeConfigured: Boolean(process.env.STRIPE_SECRET_KEY && process.env.STRIPE_WEBHOOK_SECRET),
     remindersEnabled: process.env.REMINDERS !== "off",
+    ai: aiReadiness.snapshot(),
   });
+});
+
+// Separate readiness: invalid AI credentials must not restart payments/portal.
+app.get("/health/ai", async (_req, res) => {
+  res.set("Cache-Control", "no-store");
+  const state = await aiReadiness.check();
+  if (!CHECK_PROMPT) return res.status(503).json({ ok: false, code: "AI_KNOWLEDGE_MISSING", retryable: false,
+    error: "Проверка документов отключена до восстановления базы знаний. Гайды доступны без ИИ." });
+  res.status(state.ok ? 200 : 503).json(state);
 });
 
 // --- Основной эндпоинт чата ---
@@ -435,6 +450,8 @@ app.post("/api/chat", rateLimit, async (req, res) => {
       }
     }
 
+    const readiness = await aiReadiness.check();
+    if (!readiness.ok) return res.status(503).json({ ...readiness, reply: readiness.error });
     const r = await fetchWithTimeout("https://api.anthropic.com/v1/messages", {
       method: "POST",
       headers: {
@@ -451,7 +468,9 @@ app.post("/api/chat", rateLimit, async (req, res) => {
     });
 
     if (!r.ok) {
-      console.error("Anthropic API error:", r.status, await r.text().catch(() => ""));
+      console.error("Anthropic API error:", r.status);
+      const failure = aiReadiness.recordFailure(r.status);
+      if (failure) return res.status(503).json({ ...failure, reply: failure.error });
       return res.status(502).json({ reply: "Сервис временно недоступен. Попробуй через минуту." });
     }
 
@@ -564,6 +583,8 @@ app.post("/api/check-document", heavyLimit, async (req, res) => {
       return res.status(400).json({ ok: false, error: "Пришли фото, PDF или файл документа." });
     }
 
+    const readiness = await aiReadiness.check();
+    if (!readiness.ok) return res.status(503).json(readiness);
     const r = await fetchWithTimeout("https://api.anthropic.com/v1/messages", {
       method: "POST",
       headers: {
@@ -581,7 +602,9 @@ app.post("/api/check-document", heavyLimit, async (req, res) => {
 
     if (!r.ok) {
       const errText = await r.text().catch(() => "");
-      console.error("Anthropic error (check-document):", r.status, errText.slice(0, 600));
+      console.error("Anthropic error (check-document):", r.status);
+      const failure = aiReadiness.recordFailure(r.status);
+      if (failure) return res.status(503).json(failure);
       return res.status(502).json({ ok: false, error: checkFailure(r.status, errText) });
     }
 
@@ -1620,7 +1643,10 @@ const PORT = process.env.PORT || 3000;
   } else {
     console.log("Данные клиентов шифруются");
   }
-  if (!miss.length) console.log("Настройки в порядке");
+  if (!miss.length) console.log("Обязательные переменные заданы; доступ к ИИ проверяется отдельно");
 })();
 
-app.listen(PORT, () => console.log(`IITALY proxy up on :${PORT}`));
+app.listen(PORT, () => {
+  console.log(`IITALY proxy up on :${PORT}`);
+  void aiReadiness.check();
+});

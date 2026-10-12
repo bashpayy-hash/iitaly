@@ -13,22 +13,27 @@ const originalServer = fs.readFileSync(path.join(root, 'server.js'), 'utf8');
 // Exercise the actual server wiring, encrypted files and existing handlers.
 // Express routing, timers and network are deliberately intercepted: never use a
 // production secret or a customer's code/chat, and never start a real scheduler.
-function createServerHarness(t, { enabled = false } = {}) {
+function createServerHarness(t, { enabled = false, apiKey = '', upstream } = {}) {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'iitaly-reminder-test-'));
   t.after(() => fs.rmSync(dataDir, { recursive: true, force: true }));
   const routes = new Map(), intervals = [], timeouts = [], deliveries = [], email = [];
-  const h = { routes, intervals, timeouts, deliveries, dataDir, email,
+  const h = { routes, intervals, timeouts, deliveries, dataDir, email, aiRequests: [],
     failChat: false, failEmail: false, rejectEmail: false, failRename: false, onDelivery: null };
   let time = new Date('2026-06-23T09:00:00Z');
   h.advance = ms => { time = new Date(time.getTime() + ms); };
   const request = async (url, options) => {
+    if (url.startsWith('https://api.anthropic.com/')) {
+      h.aiRequests.push({ url, options });
+      assert(upstream, 'AI network must be explicitly mocked');
+      return upstream(url, options);
+    }
     assert.match(url, /^https:\/\/api.telegram.org\/botfake-token\/sendMessage$/);
     const body = JSON.parse(options.body); deliveries.push(body);
     if (h.onDelivery) await h.onDelivery(body);
     return { ok: true, status: 200, json: async () => h.failChat && body.chat_id === 101
       ? { ok: false, error_code: 500 } : { ok: true, result: { message_id: deliveries.length } } };
   };
-  const env = { DATA_DIR: dataDir, DATA_KEY: 'synthetic-test-encryption-key', STATS_KEY: 'synthetic-test-admin-key',
+  const env = { DATA_DIR: dataDir, DATA_KEY: 'synthetic-test-encryption-key', STATS_KEY: 'synthetic-test-admin-key', ANTHROPIC_API_KEY: apiKey,
     TG_BOT_TOKEN: 'fake-token', TG_CHAT_ID: '999', TG_WEBHOOK_SECRET: 'synthetic-test-webhook',
     SMTP_HOST: 'smtp.example.invalid', SMTP_USER: 'example', SMTP_PASS: 'not-a-real-password',
     SITE_URL: 'https://example.invalid', REMINDERS: enabled ? '' : 'off' };
@@ -50,6 +55,7 @@ function createServerHarness(t, { enabled = false } = {}) {
           return fs.renameSync(from, to);
         } };
         if (name === 'crypto') return crypto;
+        if (name === './ai-readiness') return require('../ai-readiness');
         if (name === './roadmap') return { ...require('../roadmap'), buildRoadmap: () => [{ id: 'apply', title: 'Подача',
           tasks: [{ id: 'uniApply', t: 'Подать заявку', daysLeft: 7, deadline: '2026-06-30' }] }] };
         if (name === './reminders') return { ...realReminders, createReminderRunner: config => realReminders.createReminderRunner({ ...config, now: () => new Date(time) }) };
@@ -73,12 +79,45 @@ function createServerHarness(t, { enabled = false } = {}) {
     createdAt: '2026-01-01', intakeYear: 2026, profile: {}, done: {}, docs: {}, notify: { telegram: true, email: true } };
   assert(h.server.writeClient(seed.code, seed));
   h.invoke = async (method, route, { body = {}, query = {}, params = {}, headers = {} } = {}) => {
-    const response = { statusCode: 200, payload: null, status(code) { this.statusCode = code; return this; }, json(data) { this.payload = data; return this; } };
+    const response = { statusCode: 200, payload: null, set() { return this; }, status(code) { this.statusCode = code; return this; }, json(data) { this.payload = data; return this; } };
     await routes.get(`${method} ${route}`)({ body, query, params, headers, ip: '127.0.0.1' }, response);
     return response;
   };
   return h;
 }
+
+test('AI readiness: invalid key blocks documents and chat while storage stays live', async t => {
+  const h = createServerHarness(t, { apiKey: 'synthetic-key', upstream: async () => ({ ok: false, status: 401 }) });
+  const health = await h.invoke('GET', '/health/ai');
+  assert.equal(health.statusCode, 503);
+  assert.equal(health.payload.code, 'AI_AUTH_INVALID');
+  const doc = await h.invoke('POST', '/api/check-document', { body: { text: 'Synthetic document without any personal data.' } });
+  const chat = await h.invoke('POST', '/api/chat', { body: { messages: [{ role: 'user', content: 'Synthetic check' }] } });
+  assert.equal(doc.statusCode, 503); assert.equal(doc.payload.retryable, false);
+  assert.equal(chat.statusCode, 503); assert(chat.payload.reply);
+  assert.equal(h.aiRequests.length, 1);
+  assert.equal(h.aiRequests[0].options.method, 'GET');
+  assert.equal((await h.invoke('GET', '/health')).statusCode, 200);
+});
+
+test('AI readiness: revocation after successful probe prevents another document upload', async t => {
+  const h = createServerHarness(t, { apiKey: 'synthetic-key', upstream: async url => url.includes('/models/')
+    ? { ok: true, status: 200, json: async () => ({ type: 'model', id: 'test' }) }
+    : { ok: false, status: 401, text: async () => '{"error":{"type":"authentication_error"}}' } });
+  const body = { text: 'Synthetic document without any personal data.' };
+  assert.equal((await h.invoke('POST', '/api/check-document', { body })).payload.code, 'AI_AUTH_INVALID');
+  assert.equal((await h.invoke('POST', '/api/check-document', { body })).statusCode, 503);
+  assert.equal(h.aiRequests.length, 2, 'Only metadata and the first message reached the provider');
+});
+
+test('AI readiness: valid metadata and document response retain the result contract', async t => {
+  const h = createServerHarness(t, { apiKey: 'synthetic-key', upstream: async url => ({ ok: true, status: 200,
+    json: async () => url.includes('/models/') ? { type: 'model', id: 'test' }
+      : { content: [{ type: 'text', text: '{"verdict":"warn","summary":"Synthetic result"}' }] } }) });
+  const r = await h.invoke('POST', '/api/check-document', { body: { text: 'Synthetic document without any personal data.' } });
+  assert.equal(r.statusCode, 200); assert.equal(r.payload.result.verdict, 'warn');
+  assert.equal(r.payload.result.summary, 'Synthetic result');
+});
 
 test('real wiring: owner/email success does not swallow Telegram JSON failure; restart resumes', async t => {
   const h = createServerHarness(t); h.failChat = true;

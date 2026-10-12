@@ -23,14 +23,14 @@ jobs:
       - run: npm ci
 
       - name: Синтаксис
-        run: node --check server.js && node --check roadmap.js && node --check smoke-test.js && node --check reminders.js && node --check reminder-telegram.js && node --check telegram-linking.js && node --check order-store.js && node --check stripe-checkout.js
+        run: node --check server.js && node --check ai-readiness.js && node --check roadmap.js && node --check smoke-test.js && node --check reminders.js && node --check reminder-telegram.js && node --check telegram-linking.js && node --check order-store.js && node --check stripe-checkout.js
 
       - name: Изолированные проверки напоминаний
         run: |
           set -o pipefail
           node --test test/*.test.js | tee reminder-test-results.tap
 
-      # Поднимаем сервер без ключа Anthropic: чат ответит 502, и это
+      # Поднимаем сервер без ключа Anthropic: чат ответит 503 AI_KEY_MISSING, и это
       # ожидаемый результат — smoke-test знает про оба варианта. Ключ в
       # CI не нужен, а платить за прогон тестов токенами не за что.
       # DATA_DIR во временную папку: тома здесь нет, а без переменной
