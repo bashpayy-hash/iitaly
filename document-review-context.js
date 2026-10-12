@@ -79,7 +79,7 @@ function normalizeDocumentResult(parsed, review) {
     .slice(0, 6).map(p => ({ ...p, severity: p.severity === 'critical' ? 'critical' : 'minor' }));
   const checks = (Array.isArray(parsed.checks) ? parsed.checks : []).filter(c => {
     if (!c || typeof c.label !== 'string' || typeof c.note !== 'string') return false;
-    if (c.code === 'observed_content') return c.status === 'ok';
+    if (c.code === 'observed_content') return c.status === 'ok' && !c.sourceId;
     if (!allowed(c)) return false;
     return c.status === 'ok' || (['warn', 'error'].includes(c.status) && problems.some(p => p.code === c.code));
   }).slice(0, 6);

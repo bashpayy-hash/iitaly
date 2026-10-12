@@ -38,3 +38,14 @@ test('visa and unclassified uploads do not inherit scholarship rules', () => {
     assert.equal(r.verdict,'warn');assert.deepEqual(r.problems,[]);
   }
 });
+
+
+test('rule compliance cannot bypass source validation as a positive content observation', () => {
+  const r = normalizeDocumentResult({docType:'bank_statement',bankEvidence:'existing_assets',checks:[
+    {code:'observed_content',sourceId:'M',status:'ok',label:'Route',note:'Unsupported compliance claim'},
+    {code:'translation',sourceId:'BC26',status:'ok',label:'Wrong institution',note:'Wrong profile'},
+    {code:'observed_content',status:'ok',label:'Currency',note:'KZT is visible'},
+    {code:'reference_year',sourceId:'P26',status:'ok',label:'Period',note:'31.12.2025 matches Piemonte'},
+  ]},review('piemonte'));
+  assert.deepEqual(r.checks.map(c=>c.label),['Currency','Period']);
+});
