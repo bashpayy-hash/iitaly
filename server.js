@@ -5,7 +5,7 @@
 const express = require("express");
 const fs = require("fs");
 const { normalizeApiKey, anthropicHeaders, createAiReadiness } = require("./ai-readiness");
-const { buildDocumentReviewContext, documentContextPrompt } = require("./document-review-context");
+const { buildDocumentReviewContext, documentContextPrompt, normalizeDocumentResult } = require("./document-review-context");
 const { buildRoadmap, defaultIntakeYear, profileReady, needsTwelveYears } = require("./roadmap");
 const { createReminderRunner, RETRY_MS } = require("./reminders");
 const { sendTelegramReminder } = require("./reminder-telegram");
@@ -659,7 +659,7 @@ app.post("/api/check-document", heavyLimit, async (req, res) => {
       }
       return res.status(502).json({ ok: false, error: "Не удалось разобрать результат проверки. Попробуй ещё раз." });
     }
-    res.json({ ok: true, result: { ...parsed, review } });
+    res.json({ ok: true, result: normalizeDocumentResult(parsed, review) });
   } catch (e) {
     console.error("check-document error:", e.message);
     res.status(500).json({ ok: false, error: "Внутренняя ошибка сервера." });
