@@ -33,9 +33,9 @@ async function j(method, path, body) {
   r = await j("POST", "/api/chat", { messages: [{ role: "hacker", content: "x" }] });
   ok(r.status === 400, "POST /api/chat кривая роль → 400");
 
-  // 4. chat: валидный запрос — 200 (если ключ есть) или 502 (если нет), но НЕ краш
+  // 4. Missing/invalid credentials are explicit readiness failures, not a crash.
   r = await j("POST", "/api/chat", { messages: [{ role: "user", content: "Привет, что такое DSU?" }] });
-  ok(r.status === 200 || r.status === 502, "POST /api/chat валидный → " + r.status + (r.status === 200 ? " (ключ работает)" : " (нет ключа — ожидаемо локально)"));
+  ok(r.status === 200 || (r.status === 503 && r.data?.code?.startsWith('AI_')), "POST /api/chat валидный → " + r.status + (r.status === 200 ? " (ключ работает)" : " (ИИ недоступен — причина указана)"));
   if (r.status === 200) console.log("     ответ ИИ: " + String(r.data?.reply || "").slice(0, 80) + "…");
 
   // 4a. chat: первый вопрос в той форме, в какой его шлёт сайт. С октября
