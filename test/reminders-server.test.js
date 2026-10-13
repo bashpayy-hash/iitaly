@@ -18,7 +18,7 @@ function createServerHarness(t, { enabled = false, apiKey = '', workspaceId = ''
   t.after(() => fs.rmSync(dataDir, { recursive: true, force: true }));
   const routes = new Map(), intervals = [], timeouts = [], deliveries = [], email = [];
   const h = { routes, intervals, timeouts, deliveries, dataDir, email, aiRequests: [],
-    failChat: false, failEmail: false, rejectEmail: false, failRename: false, onDelivery: null };
+    failChat: false, failEmail: false, rejectEmail: false, failRename: false, failClientWrite: false, onDelivery: null };
   let time = new Date('2026-06-23T09:00:00Z');
   h.advance = ms => { time = new Date(time.getTime() + ms); };
   const request = async (url, options) => {
@@ -51,12 +51,16 @@ function createServerHarness(t, { enabled = false, apiKey = '', workspaceId = ''
       fetch: request, module: { exports: {} },
       require(name) {
         if (name === 'express') return express;
-        if (name === 'fs') return { ...fs, renameSync(from, to) {
+        if (name === 'fs') return { ...fs, writeFileSync(file, ...args) {
+          if (h.failClientWrite && file === path.join(dataDir, 'clients/TEST-001.json')) throw new Error('synthetic write rejection');
+          return fs.writeFileSync(file, ...args);
+        }, renameSync(from, to) {
           if (h.failRename) throw new Error('synthetic disk failure');
           return fs.renameSync(from, to);
         } };
         if (name === 'crypto') return crypto;
         if (name === './document-review-context') return require('../document-review-context');
+        if (name === './portal-document-report') return require('../portal-document-report');
         if (name === './ai-readiness') return require('../ai-readiness');
         if (name === './roadmap') return { ...require('../roadmap'), buildRoadmap: () => [{ id: 'apply', title: 'Подача',
           tasks: [{ id: 'uniApply', t: 'Подать заявку', daysLeft: 7, deadline: '2026-06-30' }] }] };
@@ -274,4 +278,82 @@ test('document rules: unknown, inapplicable and future contexts never acquire st
     assert.equal(r.payload.result.review.rulesStatus, status);
     assert.equal(r.payload.result.review.referenceYear, null);
   }
+});
+
+test('portal document report survives encrypted storage, server reload and authenticated lookup in full', async t => {
+  const h = createServerHarness(t, { apiKey: 'synthetic-key', upstream: async url => ({ ok: true, status: 200,
+    json: async () => url.includes('/models/') ? { type: 'model', id: 'test' }
+      : { content: [{ type: 'text', text: JSON.stringify({ docType: 'bank_statement', docTitle: 'Тестовая выписка', bankEvidence: 'existing_assets',
+        checks: [{ status: 'error', code: 'reference_year', sourceId: 'BC26', label: 'Год', note: 'Видимый год: 2025.' }],
+        problems: [{ severity: 'critical', code: 'reference_year', sourceId: 'BC26', field: 'period', observed: 'Видимая дата 31.12.2025.', text: 'Нужна дата за другой год.', fix: 'Получить выписку на 31.12.2024.' }] }) }] } }) });
+  const analyzed = await h.invoke('POST', '/api/check-document', { body: { text: 'SYNTHETIC FILE CONTENT MUST NOT BE STORED.',
+    context: { profile: 'bocconi', academicYear: '2026/27', applicantScope: 'kz-family-abroad' } } });
+  const result = analyzed.payload.result;
+  const saved = await h.invoke('POST', '/api/portal/:code/doc', { params: { code: 'TEST-001' },
+    body: { surname: 'Пример', task: 'uniApply', result, fileName: 'synthetic.txt', pdf: 'RAW_INPUT_SENTINEL' } });
+  assert.equal(saved.statusCode, 200);
+  assert.deepEqual(JSON.parse(JSON.stringify(saved.payload.docs.uniApply.result)), JSON.parse(JSON.stringify(result)));
+  assert.equal(saved.payload.docs.uniApply.problems, 1);
+  assert.equal(saved.payload.docs.uniApply.critical, 1);
+  assert.equal(saved.payload.docs.uniApply.fileName, 'synthetic.txt');
+  assert.match(saved.payload.docs.uniApply.checkedAt, /^\d{4}-\d{2}-\d{2}T/);
+  const raw = fs.readFileSync(path.join(h.dataDir, 'clients/TEST-001.json'), 'utf8');
+  assert.match(raw, /^v1\./);
+  assert(!raw.includes('Видимая дата'));
+  h.server = h.load();
+  const reopened = await h.invoke('POST', '/api/portal/lookup', { body: { code: 'TEST-001', surname: 'Пример' } });
+  assert.deepEqual(JSON.parse(JSON.stringify(reopened.payload.docs.uniApply.result)), JSON.parse(JSON.stringify(result)));
+  assert.doesNotMatch(JSON.stringify(h.server.readClient('TEST-001')), /SYNTHETIC FILE CONTENT|RAW_INPUT_SENTINEL/);
+  assert.equal(h.aiRequests.length, 2, 'Saving and reopening a report makes no new AI request');
+});
+
+test('legacy document summaries remain readable without inventing a full report', async t => {
+  const h = createServerHarness(t);
+  const c = h.server.readClient('TEST-001');
+  c.docs.uniApply = { verdict: 'warn', summary: 'Legacy saved summary', problems: 1, critical: 0, checkedAt: '2026-01-01T00:00:00Z', fileName: 'legacy.pdf' };
+  assert(h.server.writeClient('TEST-001', c));
+  h.server = h.load();
+  const response = await h.invoke('POST', '/api/portal/lookup', { body: { code: 'TEST-001', surname: 'Пример' } });
+  assert.deepEqual(JSON.parse(JSON.stringify(response.payload.docs.uniApply)), JSON.parse(JSON.stringify(c.docs.uniApply)));
+  assert.equal(Object.hasOwn(response.payload.docs.uniApply, 'result'), false);
+});
+
+test('every non-ok replacement report clears earlier document completion, including warnings without critical findings', async t => {
+  const h = createServerHarness(t);
+  for (const verdict of ['warn', 'error', 'unreadable', 'unknown', undefined]) {
+    const c = h.server.readClient('TEST-001');
+    c.done.uniApply = '2026-01-01T00:00:00Z';
+    c.docs.uniApply = { verdict: 'ok', summary: 'Previous result', attempts: 1 };
+    assert(h.server.writeClient('TEST-001', c));
+    const response = await h.invoke('POST', '/api/portal/:code/doc', { params: { code: 'TEST-001' },
+      body: { surname: 'Пример', task: 'uniApply', result: { verdict, summary: 'Replacement', problems: [] } } });
+    assert.equal(response.statusCode, 200);
+    assert.equal(response.payload.done.uniApply, undefined);
+    assert.equal(response.payload.progress.done, 0);
+    assert.notEqual(response.payload.docs.uniApply.verdict, 'ok');
+    assert.equal(response.payload.docs.uniApply.attempts, 2);
+  }
+  const approved = await h.invoke('POST', '/api/portal/:code/doc', { params: { code: 'TEST-001' },
+    body: { surname: 'Пример', task: 'uniApply', result: { verdict: 'ok', summary: 'Visible checks passed.', problems: [] } } });
+  assert(approved.payload.done.uniApply);
+  assert.equal(approved.payload.progress.done, 1);
+});
+
+test('report writes reject invalid objects and special keys; auth and rejected writes preserve the previous stored report', async t => {
+  const h = createServerHarness(t);
+  const c = h.server.readClient('TEST-001');
+  c.docs.uniApply = { verdict: 'ok', summary: 'Keep previous report', attempts: 1 };
+  c.done.uniApply = '2026-01-01T00:00:00Z';
+  assert(h.server.writeClient('TEST-001', c));
+  const submit = (body) => h.invoke('POST', '/api/portal/:code/doc', { params: { code: 'TEST-001' }, body });
+  assert.equal((await submit({ surname: 'Wrong', task: 'uniApply', result: { verdict: 'error' } })).statusCode, 403);
+  assert.equal((await submit({ surname: 'Пример', task: 'uniApply', result: [] })).statusCode, 400);
+  for (const task of ['__proto__', 'constructor', 'prototype']) {
+    assert.equal((await submit({ surname: 'Пример', task, result: { verdict: 'ok' } })).statusCode, 400);
+  }
+  h.failClientWrite = true;
+  assert.equal((await submit({ surname: 'Пример', task: 'uniApply', result: { verdict: 'warn', summary: 'Unsaved report' } })).statusCode, 500);
+  assert.deepEqual(JSON.parse(JSON.stringify(h.server.readClient('TEST-001').docs.uniApply)), JSON.parse(JSON.stringify(c.docs.uniApply)));
+  assert.equal(h.server.readClient('TEST-001').done.uniApply, c.done.uniApply);
+  assert.equal({}.verdict, undefined);
 });

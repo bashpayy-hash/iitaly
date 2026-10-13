@@ -6,6 +6,7 @@ const express = require("express");
 const fs = require("fs");
 const { normalizeApiKey, anthropicHeaders, createAiReadiness } = require("./ai-readiness");
 const { buildDocumentReviewContext, documentContextPrompt, normalizeDocumentResult } = require("./document-review-context");
+const { sanitizePortalDocumentResult } = require("./portal-document-report");
 const { buildRoadmap, defaultIntakeYear, profileReady, needsTwelveYears } = require("./roadmap");
 const { createReminderRunner, RETRY_MS } = require("./reminders");
 const { sendTelegramReminder } = require("./reminder-telegram");
@@ -864,8 +865,8 @@ app.post("/api/portal/:code/task", portalLimit, (req, res) => {
 
 
 /* Проверка документа, привязанная к задаче маршрута.
-   Файл не храним — только вердикт и сводку, этого достаточно для досье
-   и не создаёт хранилища персональных документов. */
+   Сохраняем ограниченный текстовый отчёт с основаниями и действиями.
+   Исходные файлы, изображения/base64 и произвольные поля не сохраняются. */
 app.post("/api/portal/:code/doc", portalLimit, (req, res) => {
   const code = String(req.params.code || "").toUpperCase().slice(0, 12);
   const c = readClient(code);
@@ -874,34 +875,35 @@ app.post("/api/portal/:code/doc", portalLimit, (req, res) => {
     return res.status(403).json({ ok: false, error: "Нет доступа" });
   }
   const { task, result, fileName } = req.body || {};
-  if (typeof task !== "string" || !/^[a-zA-Z0-9_]{2,30}$/.test(task)) {
+  if (typeof task !== "string" || !/^[a-zA-Z0-9_]{2,30}$/.test(task) || ["__proto__", "constructor", "prototype"].includes(task)) {
     return res.status(400).json({ ok: false, error: "Некорректная задача" });
   }
-  if (!result || typeof result !== "object") {
+  const storedResult = sanitizePortalDocumentResult(result);
+  if (!storedResult) {
     return res.status(400).json({ ok: false, error: "Нет результата проверки" });
   }
 
-  const VERDICTS = ["ok", "warn", "error", "unreadable"];
-  const verdict = VERDICTS.includes(result.verdict) ? result.verdict : "warn";
-  const problems = Array.isArray(result.problems) ? result.problems.length : 0;
-  const critical = Array.isArray(result.problems)
-    ? result.problems.filter((p) => p && p.severity === "critical").length : 0;
+  const { verdict } = storedResult;
+  const problems = storedResult.problems.length;
+  const critical = storedResult.problems.filter((p) => p.severity === "critical").length;
 
   c.docs = c.docs || {};
   const prev = c.docs[task];
   c.docs[task] = {
     verdict,
-    docTitle: String(result.docTitle || "Документ").slice(0, 80),
-    summary: String(result.summary || "").slice(0, 400),
+    docTitle: storedResult.docTitle.slice(0, 80),
+    summary: storedResult.summary.slice(0, 400),
     problems, critical,
+    result: storedResult,
     fileName: typeof fileName === "string" ? fileName.slice(0, 80) : "",
     checkedAt: new Date().toISOString(),
     attempts: (prev && prev.attempts ? prev.attempts : 0) + 1,
   };
 
-  // документ без критических ошибок закрывает шаг сам
+  // A replacement report supersedes the previous result, including its completion.
+  c.done = c.done || {};
   if (verdict === "ok") c.done[task] = new Date().toISOString();
-  else if (critical > 0) delete c.done[task];
+  else delete c.done[task];
 
   c.updatedAt = new Date().toISOString();
   if (!writeClient(code, c)) return res.status(500).json({ ok: false, error: "Не удалось сохранить" });
