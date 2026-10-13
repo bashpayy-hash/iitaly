@@ -29,6 +29,14 @@ Missing/invalid context stays unspecified. Old clients therefore receive content
 
 The model still performs probabilistic interpretation: deterministic context and source ownership reduce false rules but do not guarantee error-free judgements. Uploaded documents remain untrusted input. Do not log their contents or use customer files as test fixtures.
 
+## Saved portal reports
+
+`POST /api/portal/:code/doc` stores the textual report in `docs[taskId].result`. Authenticated lookup returns that snapshot after a reload. Existing summary, verdict, counts, filename, check time and attempt fields remain available; legacy records without `result` remain summaries and are not expanded into invented reports.
+
+The storage boundary allows only report fields and bounded evidence: six checks, six findings, three next steps and eight registry sources, with individual UTF-8 text limits. It retains observed facts, finding/check codes, field names, source IDs, selected context and the supplied audit date/version. Source labels and URLs come from the server registry. Raw uploads, images, base64 fields and arbitrary nested properties are not copied. Stored evidence text can contain excerpts from the document and receives the same encryption/access controls as the client record.
+
+Saving does not rerun the AI or reinterpret a report under newer rules. Invalid/unknown verdicts stay limited; conflicting `ok` payloads are downgraded. A replacement report clears any earlier task completion unless its stored verdict is `ok`. This remains an authenticated client-supplied report, not a signed attestation from the analysis endpoint or an institutional approval.
+
 ## Updating the base
 
 1. Open the institution's new bando, relevant annexes, corrections and document guidance. Verify the non-EU foreign-family branch separately from ordinary ISEE/EU rules.
