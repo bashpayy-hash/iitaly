@@ -55,3 +55,12 @@ test('12-year education removes the extra-year stage and enables document timing
   assert.equal(apostille.deadline, '2027-01-31');
   assert.equal(apostille.deadlineKind, 'Ориентир');
 });
+
+test('every task exposes a short explainer and apostille offers an instruction first', () => {
+  const route = buildRoadmap(null, { education: 'НИШ / 12 лет', goal: 'Бакалавриат', budget: 'До 3 млн ₸/год' }, 2027);
+  for (const stage of route) for (const task of stage.tasks) assert.equal(typeof task.short_explainer, 'string');
+  const apostille = taskById(route, 'apostille');
+  assert.equal(apostille.instruction_title, 'Как поставить апостиль');
+  assert.match(apostille.assistant_question, /Казахстане/);
+  assert(!taskById(route, 'profile').explain.includes('Класс'));
+});
