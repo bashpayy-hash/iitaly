@@ -43,6 +43,7 @@ function needsTwelveYears(profile) {
 
 const DIPLOMA_DEPENDENT = new Set(["apostille", "translate", "notary", "cimea"]);
 
+const STEP_COPY = require("./portal-step-copy.json");
 const STAGES = [
   {
     id: "start",
@@ -51,7 +52,7 @@ const STAGES = [
       {
         id: "profile",
         t: "Расскажи о себе",
-        explain: "Класс, цель и бюджет нужны, чтобы убрать лишние шаги и поставить задачи в правильном порядке.",
+        explain: "Этап учёбы, цель и бюджет помогают убрать лишние шаги и расставить задачи по порядку.",
         owner: "Ты",
         time: "~7 мин",
       },
@@ -369,6 +370,9 @@ function buildRoadmap(_tier, profile, intakeYear) {
         id: t.id,
         t: t.t,
         explain: t.explain || null,
+        short_explainer: STEP_COPY[t.id]?.short_explainer || "",
+        instruction_title: STEP_COPY[t.id]?.instruction_title || "",
+        assistant_question: STEP_COPY[t.id]?.question || "",
         owner: t.owner || "Ты",
         time: t.time || null,
         ai: !!t.ai,

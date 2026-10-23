@@ -791,6 +791,16 @@ app.post("/api/portal/:code/profile", portalLimit, (req, res) => {
   const body = req.body || {};
   const p = c.profile = c.profile || {};
 
+  // Catalogue IDs only. Store them with the authenticated, encrypted profile;
+  // changing a shortlist must not replace unrelated answers or documents.
+  if (body.universityIds !== undefined) {
+    if (!Array.isArray(body.universityIds) || body.universityIds.length > 43 ||
+        body.universityIds.some(id => typeof id !== "string" || !/^[a-z0-9][a-z0-9-]{0,63}$/.test(id))) {
+      return res.status(400).json({ ok: false, error: "Проверь список университетов" });
+    }
+    p.universityIds = [...new Set(body.universityIds)];
+  }
+
   for (const key of ["education", "goal", "budget"]) {
     if (body[key] !== undefined) {
       if (typeof body[key] !== "string" || !PROFILE_VALUES[key].has(body[key])) {

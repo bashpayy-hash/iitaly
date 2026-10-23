@@ -357,3 +357,36 @@ test('report writes reject invalid objects and special keys; auth and rejected w
   assert.equal(h.server.readClient('TEST-001').done.uniApply, c.done.uniApply);
   assert.equal({}.verdict, undefined);
 });
+
+test('profile shortlist is authenticated, encrypted and restored after server restart', async t => {
+  const h = createServerHarness(t);
+  const seed = h.server.readClient('TEST-001');
+  seed.profile = { education: 'НИШ / 12 лет', goal: 'Бакалавриат', budget: 'До 3 млн ₸/год', onboardingDone: true };
+  seed.done = { shortlist: '2026-06-22T10:00:00Z' };
+  seed.docs = { apostille: { verdict: 'ok', fileName: 'synthetic.txt' } };
+  h.server.writeClient('TEST-001', seed);
+  const saved = await h.invoke('POST', '/api/portal/:code/profile', { params: { code: 'TEST-001' }, body: { surname: 'Пример', universityIds: ['bocconi', 'unipd', 'bocconi'] } });
+  assert.equal(saved.statusCode, 200);
+  assert.deepEqual(Array.from(saved.payload.client.profile.universityIds), ['bocconi', 'unipd']);
+  assert.equal(saved.payload.client.profile.education, seed.profile.education);
+  assert.equal(saved.payload.done.shortlist, seed.done.shortlist);
+  assert.equal(saved.payload.docs.apostille.fileName, seed.docs.apostille.fileName);
+  assert(!fs.readFileSync(path.join(h.dataDir, 'clients/TEST-001.json'), 'utf8').includes('bocconi'));
+  h.server = h.load();
+  const reopened = await h.invoke('POST', '/api/portal/lookup', { body: { code: 'TEST-001', surname: 'Пример' } });
+  assert.deepEqual(Array.from(reopened.payload.client.profile.universityIds), ['bocconi', 'unipd']);
+});
+
+test('profile shortlist rejects unauthorized, malformed and failed writes without losing the saved choice', async t => {
+  const h = createServerHarness(t);
+  const seed = h.server.readClient('TEST-001'); seed.profile.universityIds = ['bocconi']; h.server.writeClient('TEST-001', seed);
+  for (const [surname, universityIds, expected] of [['Другой', ['unipd'], 403], ['Пример', ['../secrets'], 400], ['Пример', 'bocconi', 400], ['Пример', Array(44).fill('bocconi'), 400]]) {
+    const response = await h.invoke('POST', '/api/portal/:code/profile', { params: { code: 'TEST-001' }, body: { surname, universityIds } });
+    assert.equal(response.statusCode, expected);
+    assert.deepEqual(Array.from(h.server.readClient('TEST-001').profile.universityIds), ['bocconi']);
+  }
+  h.failClientWrite = true;
+  const failed = await h.invoke('POST', '/api/portal/:code/profile', { params: { code: 'TEST-001' }, body: { surname: 'Пример', universityIds: ['unipd'] } });
+  assert.equal(failed.statusCode, 500);
+  assert.deepEqual(Array.from(h.server.readClient('TEST-001').profile.universityIds), ['bocconi']);
+});
