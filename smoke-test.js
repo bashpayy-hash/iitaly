@@ -52,7 +52,7 @@ async function j(method, path, body) {
   ok(r.status === 400 && /длинн/.test(r.data?.reply || ""), "POST /api/chat сообщение длиннее лимита → 400 с понятной причиной");
 
   // 5. order: валидный
-  r = await j("POST", "/api/order", { product: "Поступление под ключ", price: 667, name: "Тест", surname: "Пользователь", phone: "+77071234567" });
+  r = await j("POST", "/api/order", { product: "Поступление под ключ", price: 10990, name: "Тест", surname: "Пользователь", phone: "+77071234567" });
   ok(r.status === 200 && r.data?.ok === true, "POST /api/order валидный → 200");
 
   // 6. order: кривой телефон
@@ -133,7 +133,7 @@ async function j(method, path, body) {
      дублируют src/data/pricing.ts во фронтенд-репозитории; меняются
      оба места одним заходом. */
   const prompt = require("fs").readFileSync(__dirname + "/system-prompt.txt", "utf8");
-  ok(prompt.includes("667 \u20b8"), "промпт называет цену 667 ₸");
+  ok(prompt.includes("10 990 \u20b8"), "промпт называет цену 10 990 ₸");
   ok(!prompt.includes("27 000 \u20b8"), "в промпте нет старой цены 27 000 ₸");
   ok(prompt.includes("16 900 \u20b8"), "промпт называет срочную проверку 16 900 ₸");
   // Границу слева проверяем вручную: «16 900 ₸» содержит в себе «6 900 ₸»,
