@@ -1253,7 +1253,7 @@ app.post("/api/lead", orderLimit, async (req, res) => {
 });
 
 const PRODUCT_CATALOG = new Map([
-  ["Поступление под ключ", { price: 667, fulfillment: "portal" }],
+  ["Поступление под ключ", { price: 10990, fulfillment: "portal" }],
   ["Срочная проверка · 1 документ", { price: 16900, fulfillment: "manual" }],
 ]);
 
@@ -1333,7 +1333,7 @@ app.post("/api/order", orderLimit, async (req, res) => {
 });
 
 // Create a Stripe-hosted Checkout Session. The server owns the product price:
-// the browser cannot change 25 000 ₸ into another amount.
+// the browser cannot override the catalogue amount.
 app.post("/api/stripe/checkout", orderLimit, async (req, res) => {
   try {
     if (!process.env.STRIPE_SECRET_KEY) {

@@ -13,7 +13,7 @@ const originalServer = fs.readFileSync(path.join(root, 'server.js'), 'utf8');
 // Exercise the actual server wiring, encrypted files and existing handlers.
 // Express routing, timers and network are deliberately intercepted: never use a
 // production secret or a customer's code/chat, and never start a real scheduler.
-function createServerHarness(t, { enabled = false, apiKey = '', workspaceId = '', upstream } = {}) {
+function createServerHarness(t, { enabled = false, apiKey = '', workspaceId = '', upstream, stripeUpstream } = {}) {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'iitaly-reminder-test-'));
   t.after(() => fs.rmSync(dataDir, { recursive: true, force: true }));
   const routes = new Map(), intervals = [], timeouts = [], deliveries = [], email = [];
@@ -34,7 +34,7 @@ function createServerHarness(t, { enabled = false, apiKey = '', workspaceId = ''
       ? { ok: false, error_code: 500 } : { ok: true, result: { message_id: deliveries.length } } };
   };
   const env = { DATA_DIR: dataDir, DATA_KEY: 'synthetic-test-encryption-key', STATS_KEY: 'synthetic-test-admin-key', ANTHROPIC_API_KEY: apiKey,
-    ANTHROPIC_WORKSPACE_ID: workspaceId,
+    ANTHROPIC_WORKSPACE_ID: workspaceId, STRIPE_SECRET_KEY: stripeUpstream ? 'sk_test_synthetic' : '',
     TG_BOT_TOKEN: 'fake-token', TG_CHAT_ID: '999', TG_WEBHOOK_SECRET: 'synthetic-test-webhook',
     SMTP_HOST: 'smtp.example.invalid', SMTP_USER: 'example', SMTP_PASS: 'not-a-real-password',
     SITE_URL: 'https://example.invalid', REMINDERS: enabled ? '' : 'off' };
@@ -68,7 +68,13 @@ function createServerHarness(t, { enabled = false, apiKey = '', workspaceId = ''
         if (name === './reminder-telegram') return { sendTelegramReminder: (token, id, text) => require('../reminder-telegram').sendTelegramReminder(token, id, text, request) };
         if (name === './telegram-linking') return require('../telegram-linking');
         if (name === './order-store') return require('../order-store');
-        if (name === './stripe-checkout') return require('../stripe-checkout');
+        if (name === './stripe-checkout') {
+          const stripe = require('../stripe-checkout');
+          return { ...stripe, createCheckoutSession: options => stripe.createCheckoutSession({ ...options, fetchImpl: async (...args) => {
+            assert(stripeUpstream, 'Stripe network must be explicitly mocked');
+            return stripeUpstream(...args);
+          } }) };
+        }
         if (name === 'nodemailer') return { createTransport: () => ({ sendMail: async options => {
           email.push(options);
           if (h.failEmail) throw new Error('SMTP fake failure');
@@ -91,6 +97,32 @@ function createServerHarness(t, { enabled = false, apiKey = '', workspaceId = ''
   };
   return h;
 }
+
+test('launch price: server checkout and manual orders ignore client amounts; prompt agrees', async t => {
+  const requests = [];
+  const h = createServerHarness(t, { stripeUpstream: async (url, options) => {
+    assert.equal(url, 'https://api.stripe.com/v1/checkout/sessions');
+    requests.push(new URLSearchParams(options.body));
+    return { ok: true, json: async () => ({ id: 'cs_test_launch', url: 'https://checkout.stripe.com/c/pay/test' }) };
+  } });
+  const store = require('../order-store').createOrderStore({ dir: h.dataDir, key: 'synthetic-test-encryption-key' });
+  for (const [product, price] of [['Поступление под ключ', 10990], ['Срочная проверка · 1 документ', 16900]]) {
+    const body = { product, price: 1, name: 'Test', surname: 'Buyer', phone: '+77000000000' };
+    const checkout = await h.invoke('POST', '/api/stripe/checkout', { body });
+    assert.equal(checkout.statusCode, 200);
+    assert.equal(checkout.payload.ok, true);
+    assert.equal(requests.at(-1).get('line_items[0][price_data][currency]'), 'kzt');
+    assert.equal(requests.at(-1).get('line_items[0][price_data][unit_amount]'), String(price * 100));
+    assert.equal(store.read(checkout.payload.orderId).price, price);
+    const manual = await h.invoke('POST', '/api/order', { body });
+    assert.equal(manual.statusCode, 200);
+    assert.equal(store.read(manual.payload.orderId).price, price);
+  }
+  const prompt = fs.readFileSync(path.join(root, 'system-prompt.txt'), 'utf8');
+  assert.match(prompt, /ЦЕНА: 10 990 ₸/);
+  assert.match(prompt, /10 990 ₸ за поступление под ключ и 16 900 ₸ за срочную проверку/);
+  assert.doesNotMatch(prompt, /667\s*₸/);
+});
 
 test('AI readiness: invalid key blocks documents and chat while storage stays live', async t => {
   const h = createServerHarness(t, { apiKey: 'synthetic-key', upstream: async () => ({ ok: false, status: 401 }) });
