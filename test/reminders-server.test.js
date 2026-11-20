@@ -68,6 +68,7 @@ function createServerHarness(t, { enabled = false, apiKey = '', workspaceId = ''
         if (name === './reminder-telegram') return { sendTelegramReminder: (token, id, text) => require('../reminder-telegram').sendTelegramReminder(token, id, text, request) };
         if (name === './telegram-linking') return require('../telegram-linking');
         if (name === './order-store') return require('../order-store');
+        if (name === './portal-recovery') return require('../portal-recovery');
         if (name === './stripe-checkout') {
           const stripe = require('../stripe-checkout');
           return { ...stripe, createCheckoutSession: options => stripe.createCheckoutSession({ ...options, fetchImpl: async (...args) => {
@@ -421,4 +422,73 @@ test('profile shortlist rejects unauthorized, malformed and failed writes withou
   const failed = await h.invoke('POST', '/api/portal/:code/profile', { params: { code: 'TEST-001' }, body: { surname: 'Пример', universityIds: ['unipd'] } });
   assert.equal(failed.statusCode, 500);
   assert.deepEqual(Array.from(h.server.readClient('TEST-001').profile.universityIds), ['bocconi']);
+});
+
+// Payloads come from the vm realm; compare their JSON, not their prototypes.
+const plainJson = value => JSON.parse(JSON.stringify(value));
+const flushRecovery = async () => { for (let i = 0; i < 8; i++) await new Promise(resolve => setImmediate(resolve)); };
+
+test('portal recovery: the code goes only to the client\'s own Telegram and email; every answer is the same', async t => {
+  const h = createServerHarness(t);
+  const client = { code: 'RCVR-2026', name: 'Тест', surname: 'Ёлкина', phone: '+7 700 000 00 01', tgChatId: 202,
+    email: 'recover@example.invalid', createdAt: '2026-01-01', intakeYear: 2026, profile: {}, done: {}, docs: {},
+    notify: { telegram: true, email: false } };
+  assert(h.server.writeClient(client.code, client));
+  const found = await h.invoke('POST', '/api/portal/recover', { body: { surname: ' елкина ', phone: '87000000001' } });
+  const missing = await h.invoke('POST', '/api/portal/recover', { body: { surname: 'Ёлкина', phone: '+7 700 000 00 09' } });
+  await flushRecovery();
+  assert.equal(found.statusCode, 200);
+  assert.deepEqual(plainJson(found.payload), { ok: true });
+  assert.deepEqual(plainJson(missing.payload), plainJson(found.payload));
+  const telegram = h.deliveries.filter(d => d.chat_id === 202);
+  assert.equal(telegram.length, 1);
+  assert.match(telegram[0].text, /Код: RCVR-2026/);
+  assert.match(telegram[0].text, /https:\/\/example\.invalid\/portal/);
+  assert.equal(h.email.length, 1, 'the account email is used even with reminder emails off');
+  assert.equal(h.email[0].to, 'recover@example.invalid');
+  assert.match(h.email[0].text, /RCVR-2026/);
+  assert.equal(h.deliveries.filter(d => String(d.chat_id) === '999').length, 0, 'the owner is not bothered when the client got the code');
+  await h.invoke('POST', '/api/portal/recover', { body: { surname: 'Ёлкина', phone: '+77000000001' } });
+  await flushRecovery();
+  assert.equal(h.deliveries.filter(d => d.chat_id === 202).length, 1, 'a second request inside two minutes sends nothing');
+});
+
+test('portal recovery: with no Telegram or email the owner gets the code to send by hand; bad input is refused', async t => {
+  const h = createServerHarness(t);
+  assert(h.server.writeClient('RCVR-0000', { code: 'RCVR-0000', name: 'Без', surname: 'Каналов', phone: '+77000000002',
+    tgChatId: null, email: '', createdAt: '2026-01-01', intakeYear: 2026, profile: {}, done: {}, docs: {}, notify: { telegram: true, email: false } }));
+  const asked = await h.invoke('POST', '/api/portal/recover', { body: { surname: 'Каналов', phone: '8 700 000 00 02' } });
+  await flushRecovery();
+  assert.deepEqual(plainJson(asked.payload), { ok: true });
+  const owner = h.deliveries.filter(d => String(d.chat_id) === '999');
+  assert.equal(owner.length, 1);
+  assert.match(owner[0].text, /RCVR-0000/);
+  assert.match(owner[0].text, /WhatsApp/);
+  assert.equal(h.email.length, 0);
+  for (const body of [{ surname: 'Каналов', phone: '123' }, { surname: '', phone: '+77000000002' }, {}]) {
+    const refused = await h.invoke('POST', '/api/portal/recover', { body });
+    assert.equal(refused.statusCode, 400);
+    assert.equal(refused.payload.ok, false);
+  }
+});
+
+test('purchase email is optional, validated, kept on the order and handed to the activated cabinet', async t => {
+  const h = createServerHarness(t);
+  const store = require('../order-store').createOrderStore({ dir: h.dataDir, key: 'synthetic-test-encryption-key' });
+  const base = { product: 'Поступление под ключ', name: 'Test', surname: 'Buyer', phone: '+77000000003' };
+  const bad = await h.invoke('POST', '/api/order', { body: { ...base, email: 'not-an-email' } });
+  assert.equal(bad.statusCode, 400);
+  const without = await h.invoke('POST', '/api/order', { body: base });
+  assert.equal(without.statusCode, 200);
+  assert.equal(store.read(without.payload.orderId).email, '');
+  const withMail = await h.invoke('POST', '/api/order', { body: { ...base, email: ' buyer@example.invalid ' } });
+  assert.equal(store.read(withMail.payload.orderId).email, 'buyer@example.invalid');
+  const confirm = await h.invoke('POST', '/api/admin/orders/:id/confirm', { params: { id: withMail.payload.orderId } });
+  assert.equal(confirm.statusCode, 200);
+  assert.equal(h.server.readClient(confirm.payload.code).email, 'buyer@example.invalid');
+  await h.invoke('POST', '/api/portal/recover', { body: { surname: 'buyer', phone: '+7 700 000 00 03' } });
+  await flushRecovery();
+  assert.equal(h.email.length, 1);
+  assert.equal(h.email[0].to, 'buyer@example.invalid');
+  assert.match(h.email[0].text, new RegExp('Код: ' + confirm.payload.code));
 });

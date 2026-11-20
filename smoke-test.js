@@ -97,6 +97,12 @@ async function j(method, path, body) {
   r = await j("POST", "/api/portal/lookup", { code: "../../etc", surname: "x" });
   ok(r.status === 404, "POST /api/portal/lookup обход каталога → 404");
 
+  // 14a. «Не помню код»: ответ одинаковый и без кода, неполные данные — 400
+  r = await j("POST", "/api/portal/recover", { surname: "Несуществующий", phone: "+7 700 000 00 00" });
+  ok(r.status === 200 && r.data?.ok === true && Object.keys(r.data).length === 1, "POST /api/portal/recover → 200 без подробностей");
+  r = await j("POST", "/api/portal/recover", { surname: "Несуществующий", phone: "12" });
+  ok(r.status === 400 && r.data?.ok === false, "POST /api/portal/recover без телефона → 400");
+
   // 15. Telegram: кабинет создаёт одноразовую ссылку без кода доступа в URL
   r = await j("POST", "/api/portal/create", {
     key: KEY,

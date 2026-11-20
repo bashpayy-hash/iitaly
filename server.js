@@ -12,6 +12,7 @@ const { createReminderRunner, RETRY_MS } = require("./reminders");
 const { sendTelegramReminder } = require("./reminder-telegram");
 const { makeLinkToken, findClientByToken } = require("./telegram-linking");
 const { createOrderStore } = require("./order-store");
+const { phoneKey, findRecoveryMatches, createRecoveryCooldown, deliverRecovery } = require("./portal-recovery");
 const { CURRENCY: STRIPE_CURRENCY, minorUnits, createCheckoutSession, parseVerifiedEvent } = require("./stripe-checkout");
 
 /* ---------- Почта ----------
@@ -343,6 +344,9 @@ const portalLimit = makeLimit("portal", 60);
 const eventLimit = makeLimit("event", 300, WINDOW_MS, "Слишком много событий.");
 const orderLimit = makeLimit("order", 10, WINDOW_MS,
   "Слишком много заявок подряд. Подожди пару минут.");
+// «Не помню код»: живому человеку хватает одной-двух попыток.
+const recoverLimit = makeLimit("recover", 5, WINDOW_MS,
+  "Слишком много запросов кода подряд. Подожди пару минут.");
 
 /* Вход в кабинет — отдельно и строже. Код из 8 символов подобрать
    перебором нереально (23^8), но лимит закрывает и утечку кода, и
@@ -768,6 +772,39 @@ app.post("/api/portal/lookup", portalLimit, (req, res) => {
 app.get("/api/portal/:code", portalLimit, (req, res) => {
   const code = String(req.params.code || "").toUpperCase().slice(0, 12);
   readPortal(req, res, code, req.query.surname);
+});
+
+/* «Не помню код» — подробности и правила в portal-recovery.js.
+   Ответ одинаковый для всех, код уходит только в Telegram и на почту
+   самого клиента, отправка — после ответа. */
+const recoveryCooldown = createRecoveryCooldown();
+const RECOVERY_SITE_URL = process.env.SITE_URL || "https://iitaly.net";
+
+app.post("/api/portal/recover", recoverLimit, (req, res) => {
+  const body = req.body || {};
+  const surname = String(body.surname || "").slice(0, 60);
+  const phone = String(body.phone || "").slice(0, 20);
+  if (normSurname(surname).length < 2 || !phoneKey(phone)) {
+    return res.status(400).json({ ok: false, error: "Укажи фамилию и телефон, как при оплате." });
+  }
+  res.json({ ok: true });
+  const matches = findRecoveryMatches({ surname, phone }, {
+    listCodes: () => listClients().map(file => file.replace(/\.json$/, "")),
+    readClient,
+    normSurname,
+  });
+  if (!matches.length) return;
+  deliverRecovery(matches, {
+    cooldown: recoveryCooldown,
+    siteUrl: RECOVERY_SITE_URL,
+    sendTelegram: (chatId, text) => tgSendTo(chatId, text),
+    sendEmail: (to, subject, text) => sendMail(to, subject, text),
+    alertOwner: text => tgSendTo(process.env.TG_CHAT_ID, text),
+  }).then(results => {
+    for (const r of results) {
+      console.log("PORTAL RECOVERY: " + (r.skipped ? "cooldown" : r.sent.length ? r.sent.join("+") : r.ownerAlerted ? "owner" : "nowhere"));
+    }
+  }).catch(() => console.error("portal recovery error"));
 });
 
 const PROFILE_VALUES = {
@@ -1289,6 +1326,7 @@ function activatePortalOrder(order) {
     name: order.name,
     surname: order.surname,
     phone: order.phone,
+    email: order.email || "",
     sourceOrderId: order.id,
   });
   if (!created.ok) return created;
@@ -1308,6 +1346,16 @@ function validBuyerFields({ product, name, surname, phone }) {
     typeof phone === "string" && /^[+0-9() -]{10,18}$/.test(phone);
 }
 
+/* Почта при покупке — по желанию (владелец, 20 Nov: восстановление кода).
+   Пусто или нет поля — заказ проходит как раньше; старый сайт её не шлёт. */
+function buyerEmail(value) {
+  if (value === undefined || value === null || value === "") return { ok: true, email: "" };
+  if (typeof value !== "string") return { ok: false };
+  const email = value.trim();
+  if (!email) return { ok: true, email: "" };
+  return email.length <= 80 && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) ? { ok: true, email } : { ok: false };
+}
+
 // Legacy/manual order endpoint remains available for operational fallback.
 app.post("/api/order", orderLimit, async (req, res) => {
   try {
@@ -1316,8 +1364,10 @@ app.post("/api/order", orderLimit, async (req, res) => {
     if (!offer || !validBuyerFields({ product, name, surname, phone })) {
       return res.status(400).json({ ok: false, error: "Проверь услугу, имя, фамилию и телефон." });
     }
+    const contact = buyerEmail((req.body || {}).email);
+    if (!contact.ok) return res.status(400).json({ ok: false, error: "Проверь адрес почты." });
 
-    const order = orderStore.create({ product, price: offer.price, name, surname, phone });
+    const order = orderStore.create({ product, price: offer.price, name, surname, phone, email: contact.email });
     order.fulfillment = offer.fulfillment;
     order.provider = "manual";
     if (!orderStore.write(order)) return res.status(500).json({ ok: false, error: "Не удалось сохранить заказ." });
@@ -1344,9 +1394,11 @@ app.post("/api/stripe/checkout", orderLimit, async (req, res) => {
     if (!offer || !validBuyerFields({ product, name, surname, phone })) {
       return res.status(400).json({ ok: false, error: "Проверь услугу, имя, фамилию и телефон." });
     }
+    const contact = buyerEmail((req.body || {}).email);
+    if (!contact.ok) return res.status(400).json({ ok: false, error: "Проверь адрес почты." });
 
     const access = makeOrderToken();
-    const order = orderStore.create({ product, price: offer.price, name, surname, phone });
+    const order = orderStore.create({ product, price: offer.price, name, surname, phone, email: contact.email });
     Object.assign(order, {
       fulfillment: offer.fulfillment,
       provider: "stripe",
@@ -1520,6 +1572,7 @@ app.get("/api/admin/overview", adminAuth, (_req, res) => {
     name: order.name,
     surname: order.surname || "",
     phone: order.phone,
+    email: order.email || "",
     portalCode: order.portalCode || null,
     activatedAt: order.activatedAt || null,
     provider: order.provider || "manual",
