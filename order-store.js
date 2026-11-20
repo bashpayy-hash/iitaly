@@ -69,6 +69,7 @@ function createOrderStore({ dir, key }) {
       name: String(fields.name || '').trim().slice(0, 60),
       surname: String(fields.surname || '').trim().slice(0, 60),
       phone: String(fields.phone || '').trim().slice(0, 20),
+      email: String(fields.email || '').trim().slice(0, 80),
     };
     if (!write(record)) throw new Error('order write failed');
     return record;
