@@ -107,7 +107,7 @@ test('launch price: server checkout and manual orders ignore client amounts; pro
     return { ok: true, json: async () => ({ id: 'cs_test_launch', url: 'https://checkout.stripe.com/c/pay/test' }) };
   } });
   const store = require('../order-store').createOrderStore({ dir: h.dataDir, key: 'synthetic-test-encryption-key' });
-  for (const [product, price] of [['Поступление под ключ', 10990], ['Срочная проверка · 1 документ', 16900]]) {
+  for (const [product, price] of [['Поступление под ключ', 10990], ['Срочная проверка · 1 документ', 16900], ['Тестовый доступ · для друзей', 667]]) {
     const body = { product, price: 1, name: 'Test', surname: 'Buyer', phone: '+77000000000' };
     const checkout = await h.invoke('POST', '/api/stripe/checkout', { body });
     assert.equal(checkout.statusCode, 200);
@@ -119,6 +119,12 @@ test('launch price: server checkout and manual orders ignore client amounts; pro
     assert.equal(manual.statusCode, 200);
     assert.equal(store.read(manual.payload.orderId).price, price);
   }
+  // The friends' test purchase (owner, 22 Nov) opens the real cabinet, and its
+  // name says it is a test at Stripe.
+  const friend = await h.invoke('POST', '/api/stripe/checkout', { body: { product: 'Тестовый доступ · для друзей', name: 'Test', surname: 'Friend', phone: '+77000000009' } });
+  assert.equal(friend.statusCode, 200);
+  assert.equal(store.read(friend.payload.orderId).fulfillment, 'portal');
+  assert.equal(requests.at(-1).get('line_items[0][price_data][product_data][name]'), 'Тестовый доступ · для друзей');
   const prompt = fs.readFileSync(path.join(root, 'system-prompt.txt'), 'utf8');
   assert.match(prompt, /ЦЕНА: 10 990 ₸/);
   assert.match(prompt, /10 990 ₸ за поступление под ключ и 16 900 ₸ за срочную проверку/);
