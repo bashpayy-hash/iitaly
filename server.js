@@ -1289,9 +1289,15 @@ app.post("/api/lead", orderLimit, async (req, res) => {
   }
 });
 
+/* «Тестовый доступ · для друзей» (owner, 22 Nov: «Сделай еще тестовое
+   отдельное отделение моим друзьям за 667 тенге, пометь что оно тестовое»):
+   the same cabinet as the full route, for 667 ₸, sold only from the site's
+   unlisted /test page. Its name says «Тестовый» at Stripe and in the order log,
+   and the owner's alert is marked as a test. */
 const PRODUCT_CATALOG = new Map([
   ["Поступление под ключ", { price: 10990, fulfillment: "portal" }],
   ["Срочная проверка · 1 документ", { price: 16900, fulfillment: "manual" }],
+  ["Тестовый доступ · для друзей", { price: 667, fulfillment: "portal", test: true }],
 ]);
 
 function productOffer(name) {
@@ -1515,9 +1521,10 @@ app.post("/api/stripe/webhook", async (req, res) => {
   const tgToken = process.env.TG_BOT_TOKEN, chat = process.env.TG_CHAT_ID;
   if (tgToken && chat) {
     const suffix = fulfilled?.code ? "\nКабинет: " + fulfilled.code : "\nТребуется ручное выполнение услуги.";
+    const test = productOffer(order.product)?.test ? "🧪 ТЕСТ · " + order.product + " · " + order.price + " ₸\n" : "";
     fetch("https://api.telegram.org/bot" + tgToken + "/sendMessage", {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ chat_id: chat, text: "💳 Stripe: оплачено\n" + order.id + suffix }),
+      body: JSON.stringify({ chat_id: chat, text: "💳 Stripe: оплачено\n" + test + order.id + suffix }),
     }).catch(() => {});
   }
 });
