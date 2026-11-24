@@ -420,6 +420,52 @@ app.get("/health/ai", async (_req, res) => {
   res.status(state.ok ? 200 : 503).json(state);
 });
 
+/* Бот глазами самого Telegram (владелец, 24 ноября: «насколько реально
+   работает Telegram»). Отправлять сообщения сервер умеет и без вебхука, а
+   принимать /start, /help и подключение кабинета — только если вебхук
+   зарегистрирован в Telegram (scripts/tg-setup.js) и указывает сюда. Здесь
+   видно: какой бот на токене, совпадает ли он с TG_BOT_NAME из ссылки
+   кабинета, есть ли вебхук, сколько апдейтов ждёт и последняя ошибка
+   доставки. Только чтение; токен, секрет и полный URL наружу не уходят;
+   ответ кешируется на минуту, чтобы не упираться в лимиты Telegram. */
+let tgHealthCache = { at: 0, status: 200, body: null };
+app.get("/health/telegram", async (_req, res) => {
+  res.set("Cache-Control", "no-store");
+  const token = process.env.TG_BOT_TOKEN;
+  if (!token) return res.status(503).json({ ok: false, configured: false });
+  if (tgHealthCache.body && Date.now() - tgHealthCache.at < 60000) {
+    return res.status(tgHealthCache.status).json(tgHealthCache.body);
+  }
+  const ask = async (method) => {
+    const r = await fetchWithTimeout("https://api.telegram.org/bot" + token + "/" + method, {}, 8000);
+    return r.json();
+  };
+  let status = 200, body;
+  try {
+    const [me, hook] = await Promise.all([ask("getMe"), ask("getWebhookInfo")]);
+    const info = (hook && hook.ok && hook.result) || {};
+    let host = "", pathname = "";
+    try { const u = new URL(info.url); host = u.host; pathname = u.pathname; } catch {}
+    const bot = me && me.ok && me.result ? me.result.username : null;
+    const linkBot = String(process.env.TG_BOT_NAME || "").replace(/^@/, "").trim() || null;
+    const webhook = {
+      set: Boolean(info.url),
+      host,
+      pathOk: pathname.endsWith("/api/tg/webhook"),
+      pending: Number(info.pending_update_count) || 0,
+      lastError: info.last_error_message || null,
+      lastErrorAt: info.last_error_date ? new Date(info.last_error_date * 1000).toISOString() : null,
+    };
+    const linkBotMatches = Boolean(bot && linkBot && bot.toLowerCase() === linkBot.toLowerCase());
+    body = { ok: Boolean(bot && linkBotMatches && webhook.set && webhook.pathOk), bot, linkBot, linkBotMatches, webhook };
+  } catch (e) {
+    status = 502;
+    body = { ok: false, error: "Telegram не ответил" };
+  }
+  tgHealthCache = { at: Date.now(), status, body };
+  res.status(status).json(body);
+});
+
 // --- Основной эндпоинт чата ---
 app.post("/api/chat", rateLimit, async (req, res) => {
   try {
