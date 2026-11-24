@@ -9,7 +9,7 @@ async function sendTelegramReminder(token, chatId, text, fetchImpl = globalThis.
   try {
     const response = await fetchImpl(`https://api.telegram.org/bot${token}/sendMessage`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ chat_id: chatId, text }), signal: controller.signal,
+      body: JSON.stringify({ chat_id: chatId, text, link_preview_options: { is_disabled: true } }), signal: controller.signal,
     });
     const body = await response.json();
     if (response.ok && body && body.ok === true && Number.isInteger(body.result?.message_id)) {

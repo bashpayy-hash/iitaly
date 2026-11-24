@@ -13,7 +13,7 @@ const originalServer = fs.readFileSync(path.join(root, 'server.js'), 'utf8');
 // Exercise the actual server wiring, encrypted files and existing handlers.
 // Express routing, timers and network are deliberately intercepted: never use a
 // production secret or a customer's code/chat, and never start a real scheduler.
-function createServerHarness(t, { enabled = false, apiKey = '', workspaceId = '', upstream, stripeUpstream } = {}) {
+function createServerHarness(t, { enabled = false, apiKey = '', workspaceId = '', upstream, stripeUpstream, env: extraEnv = {} } = {}) {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'iitaly-reminder-test-'));
   t.after(() => fs.rmSync(dataDir, { recursive: true, force: true }));
   const routes = new Map(), intervals = [], timeouts = [], deliveries = [], email = [];
@@ -42,7 +42,7 @@ function createServerHarness(t, { enabled = false, apiKey = '', workspaceId = ''
     ANTHROPIC_WORKSPACE_ID: workspaceId, STRIPE_SECRET_KEY: stripeUpstream ? 'sk_test_synthetic' : '',
     TG_BOT_TOKEN: 'fake-token', TG_CHAT_ID: '999', TG_WEBHOOK_SECRET: 'synthetic-test-webhook', TG_BOT_NAME: '@iitaly_test_bot',
     SMTP_HOST: 'smtp.example.invalid', SMTP_USER: 'example', SMTP_PASS: 'not-a-real-password',
-    SITE_URL: 'https://example.invalid', REMINDERS: enabled ? '' : 'off' };
+    SITE_URL: 'https://example.invalid', REMINDERS: enabled ? '' : 'off', ...extraEnv };
   h.load = () => {
     const app = { use() {}, listen() {}, get(url, ...handlers) { routes.set('GET ' + url, handlers.at(-1)); },
       post(url, ...handlers) { routes.set('POST ' + url, handlers.at(-1)); } };
@@ -187,15 +187,15 @@ test('AI workspace selection reaches metadata, chat and document requests', asyn
   assert(!JSON.stringify((await h.invoke('GET', '/health/ai')).payload).includes('wrkspc_synthetic123'));
 });
 
-test('real wiring: owner/email success does not swallow Telegram JSON failure; restart resumes', async t => {
+test('real wiring: email success does not swallow Telegram JSON failure; restart resumes', async t => {
   const h = createServerHarness(t); h.failChat = true;
-  const first = await h.server.runReminders(); assert.equal(first.failed, 1); assert.equal(first.accepted, 2);
+  const first = await h.server.runReminders(); assert.equal(first.failed, 1); assert.equal(first.accepted, 1);
   const raw = fs.readFileSync(path.join(h.dataDir, 'clients/TEST-001.json'), 'utf8');
   assert.match(raw, /^v1\./); assert(!raw.includes('student@example.invalid'));
   h.server = h.load(); h.advance(realReminders.RETRY_MS); h.failChat = false;
   await h.server.runReminders();
   assert.equal(h.deliveries.filter(d => d.chat_id === 101).length, 2);
-  assert.equal(h.deliveries.filter(d => d.chat_id === '999').length, 1);
+  assert.equal(h.deliveries.filter(d => d.chat_id === '999').length, 0, 'the owner gets no copy of a student reminder');
   assert.equal(h.email.length, 1);
 });
 
@@ -281,6 +281,50 @@ test('/health/telegram shows the bot as Telegram sees it, without the token or t
   assert.equal(mismatch.payload.ok, false);
 });
 
+test('connecting Telegram: what the bot sends, the next steps, a link to iitaly.net, no link preview', async t => {
+  // SITE_URL left at the old Netlify address must not leak into messages.
+  const h = createServerHarness(t, { env: { SITE_URL: 'https://iitaly.netlify.app' } });
+  const link = await h.invoke('POST', '/api/portal/:code/telegram-link', { params: { code: 'TEST-001' }, body: { surname: 'Пример' } });
+  assert.equal(link.payload.ok, true);
+  const token = new URL(link.payload.url).searchParams.get('start');
+  await h.invoke('POST', '/api/tg/webhook', { headers: { 'x-telegram-bot-api-secret-token': 'synthetic-test-webhook' },
+    body: { message: { chat: { id: 202, type: 'private' }, text: '/start ' + token } } });
+  const reply = h.deliveries.at(-1);
+  assert.equal(reply.chat_id, 202);
+  assert.match(reply.text, /Telegram подключён к кабинету IITALY/);
+  assert.match(reply.text, /по понедельникам — план на ближайшие недели/);
+  assert.match(reply.text, /Ближайшее по плану:\n• 30 июня — Подать заявку/);
+  assert.match(reply.text, /Кабинет: https:\/\/iitaly\.net\/portal/);
+  assert(!reply.text.includes('netlify'));
+  assert.deepEqual(reply.link_preview_options, { is_disabled: true });
+  assert.equal(h.server.readClient('TEST-001').tgChatId, 202);
+  // The same link cannot connect a second chat.
+  await h.invoke('POST', '/api/tg/webhook', { headers: { 'x-telegram-bot-api-secret-token': 'synthetic-test-webhook' },
+    body: { message: { chat: { id: 303, type: 'private' }, text: '/start ' + token } } });
+  assert.match(h.deliveries.at(-1).text, /работает 15 минут и один раз/);
+  assert.equal(h.server.readClient('TEST-001').tgChatId, 202);
+});
+
+test('the owner gets one weekly summary on Monday daytime, not a copy of every reminder', async t => {
+  const h = createServerHarness(t);
+  const owner = () => h.deliveries.filter(d => String(d.chat_id) === '999');
+  await h.server.runReminders();
+  assert.equal(owner().length, 0, 'Tuesday: no summary, no copy of the student reminder');
+  h.advance(-27 * 3600000);                         // Monday 06:00 UTC, 11:00 in Kazakhstan
+  await h.server.runReminders();
+  assert.equal(owner().length, 1);
+  const text = owner()[0].text;
+  assert.match(text, /IITALY за неделю/);
+  assert.match(text, /Учеников с кабинетом: 1/);
+  assert.match(text, /Подключили Telegram: 1 из 1/);
+  assert.match(text, /Срок на этой неделе: у 1 \(шагов: 1\)/);
+  assert(!text.includes('TEST-001') && !text.includes('Пример'), 'numbers only, no names or codes');
+  h.advance(3600000); await h.server.runReminders();
+  assert.equal(owner().length, 1, 'once a week');
+  h.server = h.load(); h.advance(3600000); await h.server.runReminders();
+  assert.equal(owner().length, 1, 'a restart does not send it again');
+});
+
 test('actual notify/task handlers stay functional and receipts do not overwrite their changes', async t => {
   const h = createServerHarness(t);
   h.onDelivery = async body => {
@@ -309,7 +353,7 @@ test('mail provider rejection cannot be mistaken for acceptance', async t => {
   await h.server.runReminders();
   const c = h.server.readClient('TEST-001'); assert.equal(Object.keys(c.reminderDelivery.channels.email.sent).length, 0);
   h.rejectEmail = false; h.advance(realReminders.RETRY_MS); await h.server.runReminders();
-  assert.equal(h.email.length, 2); assert.equal(h.deliveries.length, 2);
+  assert.equal(h.email.length, 2); assert.equal(h.deliveries.length, 1);
 });
 
 test('portal response does not expose the new delivery ledger or targets', async t => {

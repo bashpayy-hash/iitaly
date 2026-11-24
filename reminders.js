@@ -5,6 +5,26 @@ const RETRY_MS = 15 * 60 * 1000;
 const MAX_RETRY_MS = 6 * 60 * 60 * 1000;
 const CHANNELS = ['telegram', 'email', 'owner'];
 const MARKS = [1, 3, 7];
+/* Owner, 24 Nov, a screenshot of the bot: «просрочено на 292 дн… 230 дн…».
+   A step whose date passed weeks ago is either done and not ticked, or no
+   longer about this year: the bot does not count it in days. A step that
+   slipped within the last three weeks is mentioned once, by its date. */
+const LATE_WINDOW_DAYS = 21;
+// Messages arrive in the day in Kazakhstan (UTC+5), not at 5 a.m. when a
+// date flips at midnight UTC.
+const SEND_WINDOW = { utcOffsetHours: 5, from: 9, to: 21 };
+const MONTHS = ['января', 'февраля', 'марта', 'апреля', 'мая', 'июня', 'июля', 'августа', 'сентября', 'октября', 'ноября', 'декабря'];
+const plural = (n, one, few, many) => {
+  const a = Math.abs(n) % 100, b = a % 10;
+  return a > 10 && a < 20 ? many : b === 1 ? one : b >= 2 && b <= 4 ? few : many;
+};
+const ruDate = iso => { const [, m, d] = iso.split('-').map(Number); return `${d} ${MONTHS[m - 1]}`; };
+const soonWhen = days => days === 0 ? 'сегодня' : days === 1 ? 'завтра' : `через ${days} ${plural(days, 'день', 'дня', 'дней')}`;
+function inSendWindow(time, window) {
+  if (!window) return true;
+  const hour = (time.getUTCHours() + window.utcOffsetHours + 24) % 24;
+  return hour >= window.from && hour < window.to;
+}
 const plain = value => value && typeof value === 'object' && !Array.isArray(value);
 const has = (object, key) => Object.prototype.hasOwnProperty.call(object, key);
 const copy = value => JSON.parse(JSON.stringify(value));
@@ -55,6 +75,7 @@ function makeBatch(client, roadmap, ledger, state, now) {
   const already = key => has(state.sent, key) || has(ledger.legacySuppressed, key);
   const urgent = outstanding.map(task => {
     // One current urgency band, not 7 -> 3 -> 1 on successive retry ticks.
+    if (task.daysLeft < -LATE_WINDOW_DAYS) return null;
     const mark = task.daysLeft < 0 ? 'over' : MARKS.find(days => task.daysLeft <= days);
     return mark === undefined ? null : { task, key: eventKey(task, mark) };
   }).filter(item => item && !already(item.key)).slice(0, 6);
@@ -65,13 +86,22 @@ function makeBatch(client, roadmap, ledger, state, now) {
     .sort((a, b) => a.daysLeft - b.daysLeft) : [];
   // Bound provider message length even if a future roadmap has very long titles.
   const title = task => Array.from(task.t).slice(0, 120).join('');
-  const lines = urgent.map(({ task }) => (task.daysLeft < 0
-    ? `⚠ просрочено на ${-task.daysLeft} дн` : `⏰ через ${task.daysLeft} дн`) + ` — ${title(task)}`);
+  const soon = urgent.filter(({ task }) => task.daysLeft >= 0)
+    .map(({ task }) => `• ${soonWhen(task.daysLeft)}, ${ruDate(task.deadline)} — ${title(task)}`);
+  const late = urgent.filter(({ task }) => task.daysLeft < 0)
+    .map(({ task }) => `• ${ruDate(task.deadline)} — ${title(task)}`);
+  const lines = [];
+  if (soon.length) lines.push('Скоро срок:', ...soon);
+  if (late.length) {
+    if (lines.length) lines.push('');
+    lines.push('Срок прошёл, а шаг не отмечен:', ...late,
+      'Сделал — отметь в кабинете. Нет — спроси помощника в кабинете, как наверстать.');
+  }
   if (digest.length) {
     if (lines.length) lines.push('');
-    lines.push('Ближайшие полтора месяца:');
-    lines.push(...digest.slice(0, 5).map(t => `• через ${t.daysLeft} дн — ${title(t)}`));
-    if (digest.length > 5) lines.push(`… и ещё ${digest.length - 5} шагов в кабинете`);
+    lines.push(lines.length ? 'Дальше по плану:' : 'План на ближайшие недели:');
+    lines.push(...digest.slice(0, 5).map(t => `• ${ruDate(t.deadline)} — ${title(t)}`));
+    if (digest.length > 5) lines.push(`… и ещё ${digest.length - 5} ${plural(digest.length - 5, 'шаг', 'шага', 'шагов')} в кабинете`);
   }
   return {
     lines,
@@ -79,6 +109,7 @@ function makeBatch(client, roadmap, ledger, state, now) {
     keys: [...urgent.map(item => item.key), ...(digest.length ? [digestKey] : [])],
     pendingDigest: digest.length ? digestKey : null,
     overdue: urgent.some(item => item.task.daysLeft < 0),
+    soon: urgent.some(item => item.task.daysLeft >= 0),
   };
 }
 
@@ -86,14 +117,14 @@ function makeBatch(client, roadmap, ledger, state, now) {
  * existing encrypted file store is. No customer data is read during tests:
  * clock, store, roadmap and transports are all injectable. */
 function createReminderRunner({ listCodes, readClient, writeClient, buildRoadmap,
-  channelsFor, now = () => new Date(), siteUrl = 'https://iitaly.netlify.app',
-  logger = console }) {
+  channelsFor, now = () => new Date(), siteUrl = 'https://iitaly.net',
+  sendWindow = SEND_WINDOW, logger = console }) {
   let running = null;
   let telegramNotBefore = 0;
   // Keep acknowledged sends in memory if the disk write fails, and retry the
   // write BEFORE attempting any more sends. This is not a distributed outbox.
   const dirty = new Map();
-  let portalUrl = 'https://iitaly.netlify.app/portal';
+  let portalUrl = 'https://iitaly.net/portal';
   try {
     const url = new URL('/portal', siteUrl);
     if (['https:', 'http:'].includes(url.protocol)) portalUrl = url.href;
@@ -141,6 +172,7 @@ function createReminderRunner({ listCodes, readClient, writeClient, buildRoadmap
           }
           if (!plain(state.sent)) throw new Error('Invalid channel receipts');
           const time = now();
+          if (!inSendWindow(time, sendWindow)) continue;
           if (Number(state.notBefore) > time.getTime() ||
               (descriptor.transport === 'telegram' && telegramNotBefore > time.getTime())) continue;
           const batch = makeBatch(client, buildRoadmap(client), ledger, state, time);
@@ -151,17 +183,18 @@ function createReminderRunner({ listCodes, readClient, writeClient, buildRoadmap
             }
             continue;
           }
-          const clientText = `Привет, ${client.name}! Напоминание по твоему поступлению:\n\n` +
-            batch.lines.join('\n') + `\n\nОткрыть кабинет: ${portalUrl}`;
+          const clientText = `${client.name}, напоминание от IITALY.\n\n` +
+            batch.lines.join('\n') + `\n\nКабинет: ${portalUrl}`;
           const text = channel === 'owner'
             ? `Напоминание по клиенту\n${client.surname} ${client.name} · код ${code}\n\n${batch.lines.join('\n')}`
             : clientText + (channel === 'email'
-              ? '\n\nОтключить письма: кабинет → Помощь → Напоминания.'
-              : '\n\nОтключить напоминания: /stop');
+              ? '\n\nОтключить письма: кабинет → Настройки → Напоминания.'
+              : '\nОтключить напоминания: /stop');
           let result;
           try {
-            result = await descriptor.send(text, batch.overdue
-              ? 'IItaly: есть просроченные шаги' : 'IItaly: скоро дедлайн по поступлению');
+            result = await descriptor.send(text, batch.soon
+              ? 'IITALY: скоро срок по поступлению'
+              : batch.overdue ? 'IITALY: шаг с прошедшим сроком' : 'IITALY: план на ближайшие недели');
           } catch { result = { ok: false }; }
           const finished = now();
           state = copy(state);
@@ -194,11 +227,14 @@ function createReminderRunner({ listCodes, readClient, writeClient, buildRoadmap
     logger.log(`REMINDERS: checked ${stats.checked}, accepted ${stats.accepted}, failed ${stats.failed}, storage errors ${stats.storageErrors}`);
     return stats;
   }
-  return function runReminders() {
+  const runReminders = function runReminders() {
     // Timer/manual calls share one job; they cannot send the same item twice.
     if (!running) running = run().finally(() => { running = null; });
     return running;
   };
+  // The server's weekly owner summary reads the same (injectable) clock.
+  runReminders.now = now;
+  return runReminders;
 }
 
-module.exports = { createReminderRunner, RETRY_MS, MAX_RETRY_MS };
+module.exports = { createReminderRunner, RETRY_MS, MAX_RETRY_MS, SEND_WINDOW, LATE_WINDOW_DAYS, inSendWindow, ruDate, soonWhen, plural };

@@ -8,7 +8,7 @@ const { normalizeApiKey, anthropicHeaders, createAiReadiness } = require("./ai-r
 const { buildDocumentReviewContext, documentContextPrompt, normalizeDocumentResult } = require("./document-review-context");
 const { sanitizePortalDocumentResult } = require("./portal-document-report");
 const { buildRoadmap, defaultIntakeYear, profileReady, needsTwelveYears } = require("./roadmap");
-const { createReminderRunner, RETRY_MS } = require("./reminders");
+const { createReminderRunner, RETRY_MS, SEND_WINDOW, LATE_WINDOW_DAYS, inSendWindow, ruDate } = require("./reminders");
 const { sendTelegramReminder } = require("./reminder-telegram");
 const { makeLinkToken, findClientByToken } = require("./telegram-linking");
 const { createOrderStore } = require("./order-store");
@@ -382,6 +382,21 @@ async function fetchWithTimeout(url, opts, ms = 60000) {
     clearTimeout(t);
   }
 }
+
+/* Все ссылки в сообщениях и возврат после оплаты ведут на iitaly.net.
+   Владелец, 24 ноября, скриншот бота: «Открыть кабинет:
+   https://iitaly.netlify.app/portal» и под ней превью со старой ценой 667 ₸.
+   SITE_URL на Railway мог остаться старым адресом Netlify — такой адрес
+   не используем, берём основной домен. */
+function publicSiteUrl() {
+  try {
+    const u = new URL(process.env.SITE_URL || "");
+    if (u.protocol === "https:" && !/(^|\.)netlify\.app$/i.test(u.hostname) && u.hostname !== "iitaly.kz") return u.origin;
+  } catch { /* пустой или кривой SITE_URL — берём основной домен */ }
+  return "https://iitaly.net";
+}
+const PUBLIC_SITE = publicSiteUrl();
+const PORTAL_URL = PUBLIC_SITE + "/portal";
 
 // Периодическая очистка корзин, чтобы не текла память
 setInterval(() => {
@@ -824,7 +839,7 @@ app.get("/api/portal/:code", portalLimit, (req, res) => {
    Ответ одинаковый для всех, код уходит только в Telegram и на почту
    самого клиента, отправка — после ответа. */
 const recoveryCooldown = createRecoveryCooldown();
-const RECOVERY_SITE_URL = process.env.SITE_URL || "https://iitaly.net";
+const RECOVERY_SITE_URL = PUBLIC_SITE;
 
 app.post("/api/portal/recover", recoverLimit, (req, res) => {
   const body = req.body || {};
@@ -1098,13 +1113,22 @@ app.post("/api/portal/:code/telegram-link", portalLimit, (req, res) => {
    a plain /start and any other message in a private chat get a short answer:
    what the bot sends, whether this chat is connected, how to connect or stop.
    In a group the bot still answers only its commands. */
-const TG_HELP_LINKED = "Это бот IITALY. Твой кабинет подключён: по понедельникам я присылаю сводку по ближайшим шагам, "
-  + "а за 7, 3 и 1 день до срока — отдельное напоминание.\n\n"
-  + "Отвечать на вопросы здесь я не умею. Спроси ИИ-помощника в кабинете на iitaly.net.\n\n"
+const TG_SENDS = "• по понедельникам — план на ближайшие недели;\n"
+  + "• за 7, 3 и 1 день до срока — напоминание;\n"
+  + "• код доступа, если забудешь его.";
+const TG_HELP_LINKED = "Это бот IITALY. Твой кабинет подключён, я присылаю:\n" + TG_SENDS + "\n\n"
+  + "Отвечать на вопросы здесь я не умею — спроси ИИ-помощника в кабинете: " + PORTAL_URL + "\n\n"
   + "Отключить напоминания: /stop";
-const TG_HELP_GUEST = "Это бот напоминаний IITALY. Чтобы получать сводку по понедельникам и напоминания о сроках, "
-  + "открой личный кабинет на iitaly.net и нажми «Подключить Telegram» — появится безопасная ссылка.\n\n"
-  + "Отвечать на вопросы здесь я не умею. Спроси ИИ-помощника на сайте.";
+const TG_HELP_GUEST = "Это бот напоминаний IITALY. Чтобы получать план и напоминания о сроках, "
+  + "открой личный кабинет и нажми «Подключить Telegram» — появится безопасная ссылка: " + PORTAL_URL + "\n\n"
+  + "Отвечать на вопросы здесь я не умею — спроси ИИ-помощника на сайте.";
+/** Ближайшие три шага плана — чтобы сразу после подключения было видно, зачем бот. */
+function nextStepsText(c) {
+  const steps = buildRoadmap(null, c.profile, c.intakeYear).flatMap(stage => stage.tasks || [])
+    .filter(t => t.deadline && Number.isFinite(t.daysLeft) && t.daysLeft >= 0 && !(c.done && c.done[t.id]))
+    .sort((a, b) => a.daysLeft - b.daysLeft).slice(0, 3);
+  return steps.length ? "\n\nБлижайшее по плану:\n" + steps.map(t => "• " + ruDate(t.deadline) + " — " + t.t).join("\n") : "";
+}
 function tgChatLinked(chatId) {
   return listClients().some(f => {
     const cl = readClient(f.replace(/\.json$/, ""));
@@ -1138,8 +1162,8 @@ app.post("/api/tg/webhook", async (req, res) => {
         }
       }
       await tgSendTo(chatId, off
-        ? "Напоминания в Telegram отключены. Включить обратно можно в кабинете на сайте."
-        : "Этот чат не привязан к кабинету — отключать нечего.");
+        ? "Готово, напоминания в Telegram выключены. Включить снова: кабинет → Настройки → Напоминания.\n" + PORTAL_URL
+        : "Этот чат не подключён к кабинету — выключать нечего.");
       return;
     }
 
@@ -1156,7 +1180,8 @@ app.post("/api/tg/webhook", async (req, res) => {
       readClient,
     );
     if (!match) {
-      await tgSendTo(chatId, "Ссылка недействительна или истекла. Вернись в кабинет IITALY и создай новую.");
+      await tgSendTo(chatId, "Ссылка устарела или уже использована: она работает 15 минут и один раз. "
+        + "Открой кабинет и нажми «Подключить Telegram» ещё раз.\n" + PORTAL_URL);
       return;
     }
 
@@ -1170,10 +1195,11 @@ app.post("/api/tg/webhook", async (req, res) => {
       return;
     }
 
-    await tgSendTo(chatId, "Готово, " + c.name + "! Напоминания включены.\n\n"
-      + "По понедельникам буду присылать сводку по ближайшим шагам, "
-      + "а если до дедлайна останется 7, 3 или 1 день — напишу отдельно.\n\n"
-      + "Отключить: /stop");
+    let steps = "";
+    try { steps = nextStepsText(c); } catch { /* без плана — только приветствие */ }
+    await tgSendTo(chatId, "Готово, " + c.name + "! Telegram подключён к кабинету IITALY.\n\n"
+      + "Что буду присылать:\n" + TG_SENDS + steps + "\n\n"
+      + "Кабинет: " + PORTAL_URL + "\nОтключить: /stop");
     console.log("TG SUBSCRIBED");
   } catch {
     console.error("tg webhook error");
@@ -1199,7 +1225,7 @@ async function tgSendTo(chatId, text) {
   try {
     const r = await fetchWithTimeout("https://api.telegram.org/bot" + token + "/sendMessage", {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ chat_id: chatId, text }),
+      body: JSON.stringify({ chat_id: chatId, text, link_preview_options: { is_disabled: true } }),
     });
     return r.ok;
   } catch (e) { return false; }
@@ -1228,7 +1254,7 @@ const baseRunReminders = createReminderRunner({
   readClient,
   writeClient: writeReminderClient,
   buildRoadmap: client => buildRoadmap(null, client.profile, client.intakeYear),
-  siteUrl: process.env.SITE_URL || "https://iitaly.netlify.app",
+  siteUrl: PUBLIC_SITE,
   channelsFor: client => ({
     telegram: {
       enabled: Boolean(process.env.TG_BOT_TOKEN && client.tgChatId && client.notify && client.notify.telegram !== false),
@@ -1242,8 +1268,11 @@ const baseRunReminders = createReminderRunner({
       transport: "email",
       send: async (text, subject) => ({ ok: await sendMail(client.email, subject, text) }),
     },
+    /* Копия каждого напоминания каждого ученика владельцу больше не уходит
+       (владелец, 24 ноября: одно и то же приходило дважды). Вместо неё —
+       сводка раз в неделю, maybeSendOwnerDigest ниже. */
     owner: {
-      enabled: Boolean(process.env.TG_BOT_TOKEN && process.env.TG_CHAT_ID),
+      enabled: false,
       target: process.env.TG_CHAT_ID,
       transport: "telegram",
       send: text => sendTelegramReminder(process.env.TG_BOT_TOKEN, process.env.TG_CHAT_ID, text),
@@ -1254,7 +1283,51 @@ let lastReminderStats = null;
 async function runReminders() {
   const result = await baseRunReminders();
   lastReminderStats = { ...result, at: new Date().toISOString() };
+  try { await maybeSendOwnerDigest(baseRunReminders.now ? baseRunReminders.now() : new Date()); }
+  catch { console.warn("OWNER DIGEST: failed; will retry on a later tick"); }
   return result;
+}
+
+/* Владельцу — одна сводка в неделю: понедельник, днём по Казахстану.
+   Неделя отмечается в файле, чтобы перезапуск не прислал сводку второй раз.
+   Только числа, без имён и кодов. Демо-кабинет не считается. */
+const OWNER_DIGEST_FILE = () => STORE_DIR + "/owner-digest.json";
+function ownerDigestText(now) {
+  let pupils = 0, linked = 0, fresh = 0, soonPupils = 0, soonSteps = 0, latePupils = 0;
+  for (const file of listClients()) {
+    const c = readClient(file.replace(/\.json$/, ""));
+    if (!c || c.demo) continue;
+    pupils++;
+    if (c.tgChatId) linked++;
+    if (Date.parse(c.createdAt) > now.getTime() - 7 * 864e5) fresh++;
+    let soon = 0, late = false;
+    for (const t of buildRoadmap(null, c.profile, c.intakeYear).flatMap(stage => stage.tasks || [])) {
+      if (!t.deadline || !Number.isFinite(t.daysLeft) || (c.done && c.done[t.id])) continue;
+      if (t.daysLeft >= 0 && t.daysLeft <= 7) soon++;
+      if (t.daysLeft < 0 && t.daysLeft >= -LATE_WINDOW_DAYS) late = true;
+    }
+    if (soon) { soonPupils++; soonSteps += soon; }
+    if (late) latePupils++;
+  }
+  return "📊 IITALY за неделю\n\n"
+    + `Учеников с кабинетом: ${pupils}, новых за 7 дней: ${fresh}\n`
+    + `Подключили Telegram: ${linked} из ${pupils}\n`
+    + `Срок на этой неделе: у ${soonPupils} (шагов: ${soonSteps})\n`
+    + `Срок недавно прошёл, шаг не отмечен: у ${latePupils}`;
+}
+async function maybeSendOwnerDigest(now) {
+  const chat = process.env.TG_CHAT_ID;
+  if (!process.env.TG_BOT_TOKEN || !chat) return;
+  const local = new Date(now.getTime() + SEND_WINDOW.utcOffsetHours * 3600e3);
+  if (local.getUTCDay() !== 1 || !inSendWindow(now, SEND_WINDOW)) return;
+  const week = local.toISOString().slice(0, 10);
+  let last = null;
+  try { last = JSON.parse(fs.readFileSync(OWNER_DIGEST_FILE(), "utf8")).week; } catch { /* первая сводка */ }
+  if (last === week) return;
+  if (await tgSendTo(chat, ownerDigestText(now))) {
+    try { fs.writeFileSync(OWNER_DIGEST_FILE(), JSON.stringify({ week })); }
+    catch { console.warn("OWNER DIGEST: week mark not saved"); }
+  }
 }
 
 // A lightweight tick retries failed channels; receipts prevent repeat sends.
@@ -1482,7 +1555,7 @@ app.post("/api/stripe/checkout", orderLimit, async (req, res) => {
     const session = await createCheckoutSession({
       secretKey: process.env.STRIPE_SECRET_KEY,
       order,
-      siteUrl: process.env.SITE_URL || "https://iitaly.kz",
+      siteUrl: PUBLIC_SITE,
     });
     if (!session.ok) {
       order.status = "checkout_failed";
@@ -1583,10 +1656,13 @@ app.post("/api/stripe/webhook", async (req, res) => {
   res.json({ received: true });
   const tgToken = process.env.TG_BOT_TOKEN, chat = process.env.TG_CHAT_ID;
   if (tgToken && chat) {
-    const suffix = fulfilled?.code ? "\nКабинет: " + fulfilled.code : "\nТребуется ручное выполнение услуги.";
+    const who = [order.surname, order.name].filter(Boolean).join(" ") + (order.phone ? " · " + order.phone : "");
+    const text = "💳 Оплата " + Number(order.price).toLocaleString("ru-RU") + " ₸ · " + order.product + "\n" + who
+      + (fulfilled?.code ? "\nКабинет создан, код: " + fulfilled.code : "\nУслугу нужно выполнить вручную — свяжись с клиентом.")
+      + "\nЗаказ: " + order.id;
     fetch("https://api.telegram.org/bot" + tgToken + "/sendMessage", {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ chat_id: chat, text: "💳 Stripe: оплачено\n" + order.id + suffix }),
+      body: JSON.stringify({ chat_id: chat, text }),
     }).catch(() => {});
   }
 });
