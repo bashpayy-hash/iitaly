@@ -1,7 +1,7 @@
 'use strict';
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
-const { createReminderRunner, RETRY_MS, MAX_RETRY_MS } = require('../reminders');
+const { createReminderRunner, RETRY_MS, MAX_RETRY_MS, SEND_WINDOW, soonWhen, ruDate } = require('../reminders');
 const { sendTelegramReminder } = require('../reminder-telegram');
 const clone = value => JSON.parse(JSON.stringify(value));
 const task = (id = 'apply', daysLeft = 7, deadline = '2026-09-25') => ({ id, t: `Задача ${id}`, daysLeft, deadline });
@@ -12,14 +12,15 @@ function harness({ client = {}, tasks = [task()], handlers = {} } = {}) {
   const store = new Map([[seed.code, clone(seed)]]);
   let time = new Date('2026-09-18T09:00:00');
   const calls = []; const logs = [];
-  const h = { store, tasks, calls, handlers, failWrite: false };
+  // Delivery logic is tested around the clock; the daytime window has its own test.
+  const h = { store, tasks, calls, handlers, failWrite: false, sendWindow: null };
   h.current = () => store.get(seed.code);
   h.advance = ms => { time = new Date(time.getTime() + ms); };
   h.setTime = text => { time = new Date(text); };
   h.makeRunner = () => createReminderRunner({
     listCodes: () => [...store.keys()], readClient: code => store.has(code) ? clone(store.get(code)) : null,
     writeClient: (code, value) => { if (h.failWrite) return false; store.set(code, clone(value)); return true; },
-    buildRoadmap: () => [{ tasks: h.tasks }], now: () => new Date(time),
+    buildRoadmap: () => [{ tasks: h.tasks }], now: () => new Date(time), sendWindow: h.sendWindow,
     logger: { log: text => logs.push(text), warn: text => logs.push(text) },
     channelsFor: c => Object.fromEntries(['telegram', 'email', 'owner'].map(channel => [channel, {
       target: channel === 'owner' ? 999 : channel === 'telegram' ? c.tgChatId : c.email,
@@ -227,8 +228,34 @@ test('message budget handles long Unicode titles and no client access code in te
   h.setTime('2026-09-21T09:00:00'); await h.run();
   for (const call of h.calls) assert(call.text.length <= 4096);
   for (const call of h.calls.filter(c => c.channel !== 'owner')) {
-    assert(!call.text.includes('TEST-001')); assert.match(call.text, /https:\/\/iitaly.netlify.app\/portal/);
+    assert(!call.text.includes('TEST-001')); assert.match(call.text, /https:\/\/iitaly.net\/portal/);
   }
+});
+
+test('wording: dates instead of day counts; long-past steps are not chased; the Monday plan follows', async () => {
+  const h = harness({ tasks: [task('soon', 1, '2026-09-19'), task('late', -3, '2026-09-15'),
+    task('old', -230, '2026-01-31'), task('later', 20, '2026-10-08')] });
+  h.setTime('2026-09-21T09:00:00'); await h.run();
+  const text = h.calls.find(c => c.channel === 'telegram').text;
+  assert.match(text, /^Тест, напоминание от IITALY\./);
+  assert.match(text, /Скоро срок:\n• завтра, 19 сентября — Задача soon/);
+  assert.match(text, /Срок прошёл, а шаг не отмечен:\n• 15 сентября — Задача late\nСделал — отметь в кабинете/);
+  assert.match(text, /Дальше по плану:\n• 8 октября — Задача later/);
+  assert.match(text, /Кабинет: https:\/\/iitaly\.net\/portal\nОтключить напоминания: \/stop$/);
+  assert.doesNotMatch(text, /Задача old|просрочено|31 января/);
+  assert.equal(h.calls.find(c => c.channel === 'email').subject, 'IITALY: скоро срок по поступлению');
+  assert(!h.receipts('telegram').some(key => key.includes('"old"')));
+  await h.run(); assert.equal(h.count('telegram'), 1, 'nothing is left to send, the old step included');
+});
+
+test('messages wait for daytime in Kazakhstan (09:00–21:00, UTC+5)', async () => {
+  const h = harness(); h.sendWindow = SEND_WINDOW; h.run = h.makeRunner();
+  h.setTime('2026-09-18T02:30:00Z'); await h.run(); assert.equal(h.calls.length, 0, '07:30 in Kazakhstan');
+  h.setTime('2026-09-18T16:30:00Z'); await h.run(); assert.equal(h.calls.length, 0, '21:30 in Kazakhstan');
+  h.setTime('2026-09-19T04:00:00Z'); await h.run(); assert.equal(h.count('telegram'), 1, '09:00 in Kazakhstan');
+  assert.equal(soonWhen(0), 'сегодня'); assert.equal(soonWhen(1), 'завтра');
+  assert.equal(soonWhen(3), 'через 3 дня'); assert.equal(soonWhen(7), 'через 7 дней'); assert.equal(soonWhen(21), 'через 21 день');
+  assert.equal(ruDate('2026-12-01'), '1 декабря');
 });
 
 test('Telegram acceptance requires HTTP success, ok:true and a message receipt', async t => {
