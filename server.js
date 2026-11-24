@@ -1046,7 +1046,26 @@ app.post("/api/portal/:code/telegram-link", portalLimit, (req, res) => {
 });
 
 /* ---------- Подписка клиента на бота ----------
-   Telegram получает только случайный одноразовый токен, а не код кабинета. */
+   Telegram получает только случайный одноразовый токен, а не код кабинета.
+   23 Nov (owner: «проверь в целом телеграм»): the bot answered only /start
+   and /stop, and anything else a person wrote to it got silence. Now /help,
+   a plain /start and any other message in a private chat get a short answer:
+   what the bot sends, whether this chat is connected, how to connect or stop.
+   In a group the bot still answers only its commands. */
+const TG_HELP_LINKED = "Это бот IITALY. Твой кабинет подключён: по понедельникам я присылаю сводку по ближайшим шагам, "
+  + "а за 7, 3 и 1 день до срока — отдельное напоминание.\n\n"
+  + "Отвечать на вопросы здесь я не умею. Спроси ИИ-помощника в кабинете на iitaly.net.\n\n"
+  + "Отключить напоминания: /stop";
+const TG_HELP_GUEST = "Это бот напоминаний IITALY. Чтобы получать сводку по понедельникам и напоминания о сроках, "
+  + "открой личный кабинет на iitaly.net и нажми «Подключить Telegram» — появится безопасная ссылка.\n\n"
+  + "Отвечать на вопросы здесь я не умею. Спроси ИИ-помощника на сайте.";
+function tgChatLinked(chatId) {
+  return listClients().some(f => {
+    const cl = readClient(f.replace(/\.json$/, ""));
+    return Boolean(cl && cl.tgChatId === chatId);
+  });
+}
+
 app.post("/api/tg/webhook", async (req, res) => {
   res.json({ ok: true });                       // отвечаем сразу, Telegram не ждёт
   try {
@@ -1080,9 +1099,8 @@ app.post("/api/tg/webhook", async (req, res) => {
 
     const m = text.match(/^\/start\s+([A-Za-z0-9_-]{32,64})$/);
     if (!m) {
-      if (/^\/start\b/i.test(text)) {
-        await tgSendTo(chatId, "Это бот напоминаний IITALY. Открой личный кабинет на сайте и нажми «Подключить Telegram», чтобы получить новую безопасную ссылку.");
-      }
+      const command = /^\/(start|help)\b/i.test(text);
+      if (command || msg.chat.type === "private") await tgSendTo(chatId, tgChatLinked(chatId) ? TG_HELP_LINKED : TG_HELP_GUEST);
       return;
     }
 

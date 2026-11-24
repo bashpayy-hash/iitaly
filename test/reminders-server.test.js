@@ -213,6 +213,34 @@ test('real /stop handler stops pending retries and is not undone by in-flight pe
   assert.equal(h.deliveries.length, sent);
 });
 
+test('the bot answers /help and any private message, and says whether the chat is connected', async t => {
+  const h = createServerHarness(t);
+  const say = (id, text, type = 'private') => h.invoke('POST', '/api/tg/webhook', {
+    headers: { 'x-telegram-bot-api-secret-token': 'synthetic-test-webhook' },
+    body: { message: { chat: { id, type }, text } },
+  });
+  await say(101, 'привет');
+  assert.match(h.deliveries.at(-1).text, /Твой кабинет подключён/);
+  assert.match(h.deliveries.at(-1).text, /\/stop/);
+  await say(555, '/help');
+  assert.equal(h.deliveries.at(-1).chat_id, 555);
+  assert.match(h.deliveries.at(-1).text, /Подключить Telegram/);
+  await say(555, '/start');
+  assert.match(h.deliveries.at(-1).text, /Подключить Telegram/, 'a plain /start explains how to connect');
+  await say(101, '/start');
+  assert.match(h.deliveries.at(-1).text, /Твой кабинет подключён/, 'a connected chat is told it is connected');
+  const before = h.deliveries.length;
+  await say(-100777, 'обсуждаем поступление', 'group');
+  assert.equal(h.deliveries.length, before, 'in a group only commands get an answer');
+  await say(555, 'привет', 'private');
+  assert.equal(h.deliveries.length, before + 1);
+  const forged = await h.invoke('POST', '/api/tg/webhook', { headers: { 'x-telegram-bot-api-secret-token': 'wrong' },
+    body: { message: { chat: { id: 555, type: 'private' }, text: '/help' } } });
+  assert.equal(forged.payload.ok, true);
+  assert.equal(h.deliveries.length, before + 1, 'a request without the webhook secret is ignored');
+  assert.equal(h.server.readClient('TEST-001').tgChatId, 101, 'help never changes a link');
+});
+
 test('actual notify/task handlers stay functional and receipts do not overwrite their changes', async t => {
   const h = createServerHarness(t);
   h.onDelivery = async body => {
