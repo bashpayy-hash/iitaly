@@ -18,7 +18,10 @@ function createServerHarness(t, { enabled = false, apiKey = '', workspaceId = ''
   t.after(() => fs.rmSync(dataDir, { recursive: true, force: true }));
   const routes = new Map(), intervals = [], timeouts = [], deliveries = [], email = [];
   const h = { routes, intervals, timeouts, deliveries, dataDir, email, aiRequests: [],
-    failChat: false, failEmail: false, rejectEmail: false, failRename: false, failClientWrite: false, onDelivery: null };
+    failChat: false, failEmail: false, rejectEmail: false, failRename: false, failClientWrite: false, onDelivery: null,
+    telegramReads: [], telegram: {
+      getMe: { ok: true, result: { id: 1, is_bot: true, username: 'iitaly_test_bot' } },
+      getWebhookInfo: { ok: true, result: { url: 'https://example.invalid/api/tg/webhook', pending_update_count: 0 } } } };
   let time = new Date('2026-06-23T09:00:00Z');
   h.advance = ms => { time = new Date(time.getTime() + ms); };
   const request = async (url, options) => {
@@ -27,6 +30,8 @@ function createServerHarness(t, { enabled = false, apiKey = '', workspaceId = ''
       assert(upstream, 'AI network must be explicitly mocked');
       return upstream(url, options);
     }
+    const info = url.match(/^https:\/\/api.telegram.org\/botfake-token\/(getMe|getWebhookInfo)$/);
+    if (info) { h.telegramReads.push(info[1]); return { ok: true, status: 200, json: async () => h.telegram[info[1]] }; }
     assert.match(url, /^https:\/\/api.telegram.org\/botfake-token\/sendMessage$/);
     const body = JSON.parse(options.body); deliveries.push(body);
     if (h.onDelivery) await h.onDelivery(body);
@@ -35,7 +40,7 @@ function createServerHarness(t, { enabled = false, apiKey = '', workspaceId = ''
   };
   const env = { DATA_DIR: dataDir, DATA_KEY: 'synthetic-test-encryption-key', STATS_KEY: 'synthetic-test-admin-key', ANTHROPIC_API_KEY: apiKey,
     ANTHROPIC_WORKSPACE_ID: workspaceId, STRIPE_SECRET_KEY: stripeUpstream ? 'sk_test_synthetic' : '',
-    TG_BOT_TOKEN: 'fake-token', TG_CHAT_ID: '999', TG_WEBHOOK_SECRET: 'synthetic-test-webhook',
+    TG_BOT_TOKEN: 'fake-token', TG_CHAT_ID: '999', TG_WEBHOOK_SECRET: 'synthetic-test-webhook', TG_BOT_NAME: '@iitaly_test_bot',
     SMTP_HOST: 'smtp.example.invalid', SMTP_USER: 'example', SMTP_PASS: 'not-a-real-password',
     SITE_URL: 'https://example.invalid', REMINDERS: enabled ? '' : 'off' };
   h.load = () => {
@@ -239,6 +244,41 @@ test('the bot answers /help and any private message, and says whether the chat i
   assert.equal(forged.payload.ok, true);
   assert.equal(h.deliveries.length, before + 1, 'a request without the webhook secret is ignored');
   assert.equal(h.server.readClient('TEST-001').tgChatId, 101, 'help never changes a link');
+});
+
+test('/health/telegram shows the bot as Telegram sees it, without the token or the full webhook URL', async t => {
+  const h = createServerHarness(t);
+  const healthy = await h.invoke('GET', '/health/telegram');
+  assert.equal(healthy.statusCode, 200);
+  assert.deepEqual(JSON.parse(JSON.stringify(healthy.payload)), { ok: true, bot: 'iitaly_test_bot', linkBot: 'iitaly_test_bot', linkBotMatches: true,
+    webhook: { set: true, host: 'example.invalid', pathOk: true, pending: 0, lastError: null, lastErrorAt: null } });
+  assert.deepEqual(h.telegramReads.sort(), ['getMe', 'getWebhookInfo']);
+  assert(!JSON.stringify(healthy.payload).includes('fake-token'));
+  await h.invoke('GET', '/health/telegram');
+  assert.equal(h.telegramReads.length, 2, 'a second look within a minute is served from the cache');
+
+  // No webhook in Telegram: the bot can send, but never hears /start, so linking cannot work.
+  const unset = createServerHarness(t);
+  unset.telegram.getWebhookInfo = { ok: true, result: { url: '', pending_update_count: 0 } };
+  const broken = await unset.invoke('GET', '/health/telegram');
+  assert.equal(broken.payload.ok, false);
+  assert.equal(broken.payload.webhook.set, false);
+
+  // Telegram cannot deliver: the last error is shown as Telegram reports it.
+  const failing = createServerHarness(t);
+  failing.telegram.getWebhookInfo = { ok: true, result: { url: 'https://example.invalid/api/tg/webhook', pending_update_count: 7,
+    last_error_date: 1795000000, last_error_message: 'Wrong response from the webhook: 502 Bad Gateway' } };
+  const stuck = await failing.invoke('GET', '/health/telegram');
+  assert.equal(stuck.payload.webhook.pending, 7);
+  assert.equal(stuck.payload.webhook.lastError, 'Wrong response from the webhook: 502 Bad Gateway');
+  assert.equal(stuck.payload.webhook.lastErrorAt, new Date(1795000000 * 1000).toISOString());
+
+  // The cabinet links to another bot than the token's: links would open the wrong bot.
+  const other = createServerHarness(t);
+  other.telegram.getMe = { ok: true, result: { id: 2, is_bot: true, username: 'another_bot' } };
+  const mismatch = await other.invoke('GET', '/health/telegram');
+  assert.equal(mismatch.payload.linkBotMatches, false);
+  assert.equal(mismatch.payload.ok, false);
 });
 
 test('actual notify/task handlers stay functional and receipts do not overwrite their changes', async t => {
