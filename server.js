@@ -14,6 +14,8 @@ const { makeLinkToken, findClientByToken } = require("./telegram-linking");
 const { createOrderStore } = require("./order-store");
 const { phoneKey, findRecoveryMatches, createRecoveryCooldown, deliverRecovery } = require("./portal-recovery");
 const { CURRENCY: STRIPE_CURRENCY, minorUnits, createCheckoutSession, parseVerifiedEvent } = require("./stripe-checkout");
+const { requestIdentity, createWindowCounter, createDualLimit, createBudget, safeEqual, makeAccessCode,
+  createCappedLog, validEmail, plainText } = require("./request-guard");
 
 /* ---------- Почта ----------
    Настраивается переменными SMTP_HOST, SMTP_USER, SMTP_PASS, SMTP_FROM.
@@ -67,6 +69,13 @@ app.use((req, res, next) => {
   res.header("X-Content-Type-Options", "nosniff");
   res.header("Referrer-Policy", "strict-origin-when-cross-origin");
   res.header("X-Frame-Options", "DENY");
+  /* Security pass, 27 Nov: the server answers with JSON only, so nothing it
+     returns may run scripts, be cached by a proxy on the way or reveal the
+     framework. HSTS keeps the direct Railway address on HTTPS too. */
+  res.removeHeader("X-Powered-By");
+  res.header("Strict-Transport-Security", "max-age=31536000; includeSubDomains");
+  res.header("Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'");
+  res.header("Cache-Control", "no-store");
   /* Раньше здесь всегда стояла звёздочка: любой сайт в интернете мог
      дёргать наш API из браузера посетителя, включая кабинет. Теперь
      список разрешённых источников задаётся переменной ALLOWED_ORIGINS
@@ -93,17 +102,27 @@ app.use((req, res, next) => {
   next();
 });
 
-const jsonParser = express.json({ limit: "8mb" });
+/* Only the document check carries a file. Everything else is a few fields,
+   and the old single 8 MB limit let any address make the server parse 8 MB
+   on every route. Chat: up to 40 messages with the site's reference text. */
+const documentParser = express.json({ limit: "8mb" });
+const chatParser = express.json({ limit: "512kb" });
+const jsonParser = express.json({ limit: "256kb" });
 const stripeRawParser = express.raw({ type: "application/json", limit: "1mb" });
 app.use((req, res, next) => {
   if (req.path === "/api/stripe/webhook") return stripeRawParser(req, res, next);
+  if (req.path === "/api/check-document") return documentParser(req, res, next);
+  if (req.path === "/api/chat") return chatParser(req, res, next);
   return jsonParser(req, res, next);
 });
 
 // Ошибки разбора тела отдаём как JSON, а не HTML-страницей
 app.use((err, req, res, next) => {
   if (err && err.type === "entity.too.large") {
-    return res.status(413).json({ ok: false, error: "Файл слишком большой. Сожми фото или сними при меньшем разрешении." });
+    const text = req.path === "/api/check-document"
+      ? "Файл слишком большой. Сожми фото или сними при меньшем разрешении."
+      : "Запрос слишком большой.";
+    return res.status(413).json({ ok: false, reply: text, error: text });
   }
   if (err && err.status === 400 && err.type === "entity.parse.failed") {
     return res.status(400).json({ ok: false, error: "Некорректный формат запроса." });
@@ -182,13 +201,23 @@ function readClient(code) {
     return null;
   }
 }
+/* The new content goes to a temporary file and replaces the cabinet in one
+   step. Writing in place meant that a failed write (a full volume, a crash
+   half-way) left an empty or half-written cabinet where a good one was. */
 function writeClient(code, data) {
   if (!validCode(code)) return false;
+  const destination = clientPath(code);
+  const temporary = destination + "." + crypto.randomBytes(8).toString("hex") + ".tmp";
   try {
     const json = JSON.stringify(data, null, 2);
-    fs.writeFileSync(clientPath(code), encKey ? encrypt(json) : json);
+    fs.writeFileSync(temporary, encKey ? encrypt(json) : json, { mode: 0o600, flag: "wx" });
+    fs.renameSync(temporary, destination);
     return true;
-  } catch (e) { console.error("write client failed:", e.message); return false; }
+  } catch (e) {
+    try { fs.unlinkSync(temporary); } catch { /* nothing was written */ }
+    console.error("write client failed");
+    return false;
+  }
 }
 /* Логи событий, лидов и заказов лежат РЯДОМ С КАБИНЕТАМИ, на томе.
    Раньше они писались в __dirname — то есть внутрь образа приложения,
@@ -223,10 +252,7 @@ for (const [from, to] of [
 
 // Код доступа: без похожих символов, чтобы диктовать по телефону
 function makeCode() {
-  const A = "ACDEFHJKLMNPRTUVWXY3479";
-  let out = "";
-  for (let i = 0; i < 8; i++) out += A[Math.floor(Math.random() * A.length)];
-  return out.slice(0, 4) + "-" + out.slice(4);
+  return makeAccessCode();   // secure generator, see request-guard.js
 }
 
 
@@ -245,7 +271,7 @@ function createPortalClient(fields) {
     name: name.slice(0, 60),
     surname: surname.slice(0, 60),
     phone: typeof fields.phone === "string" ? fields.phone.slice(0, 20) : "",
-    email: typeof fields.email === "string" && /.+@.+\..+/.test(fields.email) ? fields.email.trim().slice(0, 80) : "",
+    email: typeof fields.email === "string" && validEmail(fields.email.trim()) ? fields.email.trim() : "",
     tgChatId: null,
     notify: { email: false, telegram: true },
     profile: fields.profile && typeof fields.profile === "object" ? fields.profile : {},
@@ -309,25 +335,30 @@ const aiReadiness = createAiReadiness({ apiKey: API_KEY, model: MODEL, workspace
    инстансе не общие. Для текущего одного инстанса этого достаточно;
    если появится второй — сюда нужен Redis, а не ещё одна Map. */
 const WINDOW_MS = 5 * 60 * 1000;
-const buckets = new Map();   // имя корзины → Map(ip → { count, start })
+/* Security pass, 27 Nov. On the live site these limits never triggered:
+   the key was the Netlify node, not the visitor (request-guard.js has the
+   measurement). Now every limit counts the visitor's own address and, with a
+   ceiling ten times higher, the machine that connected to us.
+
+   The numbers were raised at the same time. They had never been enforced, and
+   a phone on a mobile network shares its address with other subscribers:
+   limits sized for one person would have stopped real visitors on the first
+   busy day of the ads. One address still cannot run up the bill, and the
+   total is capped separately (aiSpend below). */
+const PEER_FACTOR = 10;
+const sweepable = [];
 
 function clientIp(req) {
-  return req.headers["x-forwarded-for"]?.split(",")[0]?.trim() || req.ip;
+  return requestIdentity(req).client;
 }
 
 function makeLimit(name, max, windowMs = WINDOW_MS, message) {
-  const hits = new Map();
-  buckets.set(name, hits);
-  return function limit(req, res, next) {
-    const ip = clientIp(req);
-    const now = Date.now();
-    const rec = hits.get(ip) || { count: 0, start: now };
-    if (now - rec.start > windowMs) { rec.count = 0; rec.start = now; }
-    rec.count++;
-    hits.set(ip, rec);
-    if (rec.count > max) {
-      const retry = Math.ceil((rec.start + windowMs - now) / 1000);
-      res.set("Retry-After", String(retry));
+  const limit = createDualLimit({ max, windowMs, peerFactor: PEER_FACTOR });
+  sweepable.push(limit);
+  return function limitRequest(req, res, next) {
+    const result = limit.hit(requestIdentity(req));
+    if (result.over) {
+      res.set("Retry-After", String(result.retryAfter));
       // чат ждёт поле reply, остальные — error; отдаём оба, чтобы
       // любой клиент показал человеку текст, а не «ошибка сервера»
       const text = message || "Слишком много запросов. Подожди пару минут и попробуй снова.";
@@ -337,38 +368,97 @@ function makeLimit(name, max, windowMs = WINDOW_MS, message) {
   };
 }
 
-const rateLimit = makeLimit("chat", 30);
-const heavyLimit = makeLimit("document", 12, WINDOW_MS,
-  "Проверка документов ограничена: 12 файлов за 5 минут. Подожди немного.");
-const portalLimit = makeLimit("portal", 60);
-const eventLimit = makeLimit("event", 300, WINDOW_MS, "Слишком много событий.");
-const orderLimit = makeLimit("order", 10, WINDOW_MS,
+const rateLimit = makeLimit("chat", 60);
+const heavyLimit = makeLimit("document", 20, WINDOW_MS,
+  "Проверка документов ограничена: слишком много файлов за 5 минут. Подожди немного.");
+const portalLimit = makeLimit("portal", 120);
+const eventLimit = makeLimit("event", 600, WINDOW_MS, "Слишком много событий.");
+const orderLimit = makeLimit("order", 20, WINDOW_MS,
   "Слишком много заявок подряд. Подожди пару минут.");
+/* The page after payment asks for the order up to 25 times in half a minute
+   (PaymentSuccess on the site). It shared the 10-per-5-minutes order limit,
+   and only the broken limiter kept a buyer from being cut off before the
+   access code arrived. Its own limit: a few payments from one address. */
+const orderStatusLimit = makeLimit("order-status", 150, WINDOW_MS,
+  "Слишком много запросов. Подожди минуту и обнови страницу.");
 // «Не помню код»: живому человеку хватает одной-двух попыток.
-const recoverLimit = makeLimit("recover", 5, WINDOW_MS,
+const recoverLimit = makeLimit("recover", 8, WINDOW_MS,
   "Слишком много запросов кода подряд. Подожди пару минут.");
 
-/* Вход в кабинет — отдельно и строже. Код из 8 символов подобрать
-   перебором нереально (23^8), но лимит закрывает и утечку кода, и
-   попытки угадать фамилию к известному коду, и просто шум в логах.
-   Считаем ТОЛЬКО неудачные попытки: человек, который спокойно работает
-   в своём кабинете, этого лимита не видит вообще. */
-const LOGIN_WINDOW_MS = 15 * 60 * 1000, LOGIN_MAX_FAILS = 10;
-const loginFails = new Map();
-buckets.set("login", loginFails);
+/* Вход в кабинет — отдельно и строже. Считаем ТОЛЬКО неудачные попытки:
+   человек, который спокойно работает в своём кабинете, этого лимита не
+   видит вообще. С 27 ноября счётчик один на все адреса кабинета (раньше
+   его вели только при входе, а сохранение шага, документа, настроек и
+   удаление принимали сколько угодно неверных попыток), и считает он и
+   посетителя, и подключившуюся машину. */
+const LOGIN_WINDOW_MS = 15 * 60 * 1000, LOGIN_MAX_FAILS = 12;
+const loginFails = createDualLimit({ max: LOGIN_MAX_FAILS, windowMs: LOGIN_WINDOW_MS, peerFactor: PEER_FACTOR });
+sweepable.push(loginFails);
+/* Подбор с многих адресов сразу ни один адрес не блокирует. Владелец узнаёт
+   о нём по общему числу неудач: одно сообщение в час, без кодов и имён. */
+const LOGIN_ALARM = 150;
+const loginFailsTotal = createWindowCounter(LOGIN_WINDOW_MS);
+sweepable.push(loginFailsTotal);
+let loginAlarmAt = 0;
 
 function loginBlocked(req) {
-  const rec = loginFails.get(clientIp(req));
-  if (!rec) return false;
-  if (Date.now() - rec.start > LOGIN_WINDOW_MS) return false;
-  return rec.count >= LOGIN_MAX_FAILS;
+  return loginFails.blocked(requestIdentity(req));
 }
 function noteLoginFail(req) {
-  const ip = clientIp(req), now = Date.now();
-  const rec = loginFails.get(ip) || { count: 0, start: now };
-  if (now - rec.start > LOGIN_WINDOW_MS) { rec.count = 0; rec.start = now; }
-  rec.count++;
-  loginFails.set(ip, rec);
+  loginFails.hit(requestIdentity(req));
+  if (loginFailsTotal.hit("all").count === LOGIN_ALARM && Date.now() - loginAlarmAt > 3600e3) {
+    loginAlarmAt = Date.now();
+    ownerAlert("⚠️ IITALY: " + LOGIN_ALARM + " неудачных входов в кабинеты за 15 минут. Похоже на подбор кодов. "
+      + "Адреса, с которых идёт перебор, блокируются сами; коды и фамилии не раскрыты.");
+  }
+}
+
+/* Ключ владельца (STATS_KEY). Сравнение без утечки по времени, и неверные
+   попытки считаются: ключ нельзя подбирать перебором. */
+const adminFails = createDualLimit({ max: 8, windowMs: LOGIN_WINDOW_MS, peerFactor: 3 });
+sweepable.push(adminFails);
+function adminAllowed(req, legacyKey) {
+  const who = requestIdentity(req);
+  if (adminFails.blocked(who)) return false;
+  const auth = String((req.headers && req.headers.authorization) || "");
+  const supplied = auth.startsWith("Bearer ") ? auth.slice(7) : String(legacyKey || "");
+  if (safeEqual(supplied, String(process.env.STATS_KEY || ""))) return true;
+  adminFails.hit(who);
+  return false;
+}
+
+/* Сообщение владельцу о событии безопасности. Не чаще, чем его вызывают:
+   каждый вызывающий сам следит, чтобы писать один раз. */
+function ownerAlert(text) {
+  Promise.resolve(tgSendTo(process.env.TG_CHAT_ID, text)).catch(() => {});
+}
+
+/* Потолок платных обращений к ИИ на всех вместе. Лимит по адресу держит
+   один адрес; если нагрузку размазать по многим адресам, счёт у провайдера
+   всё равно рос бы без предела. Пределы задаются переменными, значения по
+   умолчанию — с запасом на рекламный день (см. .env.example). */
+function envNumber(name, fallback) {
+  const value = Number(process.env[name]);
+  return Number.isFinite(value) && value > 0 ? Math.floor(value) : fallback;
+}
+const aiBudgets = {
+  chat: createBudget({ hourly: envNumber("AI_CHAT_PER_HOUR", 500), daily: envNumber("AI_CHAT_PER_DAY", 4000) }),
+  document: createBudget({ hourly: envNumber("AI_DOCS_PER_HOUR", 150), daily: envNumber("AI_DOCS_PER_DAY", 1000) }),
+};
+const AI_BUSY = "Сейчас слишком много запросов к помощнику. Попробуй через несколько минут.";
+function aiSpend(kind) {
+  const budget = aiBudgets[kind], taken = budget.take();
+  const label = kind === "chat" ? "вопросов помощнику" : "проверок документов";
+  const names = kind === "chat" ? "AI_CHAT_PER_HOUR / AI_CHAT_PER_DAY" : "AI_DOCS_PER_HOUR / AI_DOCS_PER_DAY";
+  if (!taken.ok && taken.first) {
+    ownerAlert("⚠️ IITALY: достигнут предел " + label + " за "
+      + (taken.window === "hour" ? "час (" + budget.hourly + ")" : "сутки (" + budget.daily + ")")
+      + ". Новые запросы получают «попробуй позже», пока окно не обновится. "
+      + "Если это живые посетители, подними предел на Railway: " + names + ".");
+  } else if (taken.ok && taken.nearly) {
+    ownerAlert("ℹ️ IITALY: израсходовано 80% суточного предела " + label + " (" + taken.used + " из " + budget.daily + ").");
+  }
+  return taken.ok;
 }
 
 /* Запрос с ограничением по времени: если внешний сервис не отвечает,
@@ -400,11 +490,7 @@ const PORTAL_URL = PUBLIC_SITE + "/portal";
 
 // Периодическая очистка корзин, чтобы не текла память
 setInterval(() => {
-  const now = Date.now();
-  for (const [name, hits] of buckets) {
-    const ttl = name === "login" ? LOGIN_WINDOW_MS : WINDOW_MS;
-    for (const [ip, rec] of hits) if (now - rec.start > ttl) hits.delete(ip);
-  }
+  for (const counter of sweepable) counter.sweep();
 }, WINDOW_MS);
 
 // --- Health check для Railway/Render ---
@@ -426,22 +512,13 @@ app.get("/health", (_req, res) => {
   });
 });
 
-/* What the server sees as the caller's address (security pass, 27 Nov).
-   The per-address limits did not trigger on the live site: 40 requests in a
-   row passed a limit of 10. This shows the caller only their own request
-   path — which forwarding headers arrive and which value the limiter uses —
-   so the limiter can be keyed on the right one. */
+/* The address the limits count for the caller — their own, nothing else.
+   It is how the 27 Nov limiter fix was measured and how it can be re-checked
+   from any device: through the site this must be the device's address, not
+   a Netlify node. */
 app.get("/health/ip", (req, res) => {
-  res.set("Cache-Control", "no-store");
-  const list = String(req.headers["x-forwarded-for"] || "").split(",").map(v => v.trim()).filter(Boolean);
-  res.json({
-    ok: true,
-    limiterKey: clientIp(req),
-    forwardedFor: list.slice(0, 8),
-    realIp: req.headers["x-real-ip"] || null,
-    netlifyClientIp: req.headers["x-nf-client-connection-ip"] || null,
-    socket: req.socket && req.socket.remoteAddress || null,
-  });
+  const who = requestIdentity(req);
+  res.json({ ok: true, ip: who.client, proxied: who.client !== who.peer });
 });
 
 // Separate readiness: invalid AI credentials must not restart payments/portal.
@@ -500,6 +577,7 @@ app.get("/health/telegram", async (_req, res) => {
 });
 
 // --- Основной эндпоинт чата ---
+const CHAT_MAX_CHARS = 60000;
 app.post("/api/chat", rateLimit, async (req, res) => {
   try {
     const { messages, profile } = req.body || {};
@@ -528,6 +606,7 @@ app.post("/api/chat", rateLimit, async (req, res) => {
        Длину проверяем отдельно от формы и отвечаем по-человечески: длинное
        сообщение — единственная из этих ошибок, которую человек может
        исправить сам. */
+    let totalLength = 0;
     for (const m of messages) {
       if (!m || (m.role !== "user" && m.role !== "assistant") || typeof m.content !== "string") {
         return res.status(400).json({ reply: "Некорректный запрос." });
@@ -535,10 +614,18 @@ app.post("/api/chat", rateLimit, async (req, res) => {
       if (m.content.length > 8000) {
         return res.status(400).json({ reply: "Сообщение слишком длинное. Сократи вопрос или раздели его на несколько." });
       }
+      totalLength += m.content.length;
+    }
+    /* Whole dialogue, not only each message: 40 messages of 8000 characters
+       passed the checks above, and every such request was paid for in full.
+       A real dialogue with the site's reference text stays well under this. */
+    if (totalLength > CHAT_MAX_CHARS) {
+      return res.status(400).json({ reply: "Диалог стал слишком длинным. Начни новый разговор." });
     }
 
     const readiness = await aiReadiness.check();
     if (!readiness.ok) return res.status(503).json({ ...readiness, reply: readiness.error });
+    if (!aiSpend("chat")) return res.status(503).json({ ok: false, code: "AI_BUSY", retryable: true, reply: AI_BUSY, error: AI_BUSY });
     const r = await fetchWithTimeout("https://api.anthropic.com/v1/messages", {
       method: "POST",
       headers: {
@@ -672,6 +759,7 @@ app.post("/api/check-document", heavyLimit, async (req, res) => {
 
     const readiness = await aiReadiness.check();
     if (!readiness.ok) return res.status(503).json(readiness);
+    if (!aiSpend("document")) return res.status(503).json({ ok: false, code: "AI_BUSY", retryable: true, error: AI_BUSY });
     const r = await fetchWithTimeout("https://api.anthropic.com/v1/messages", {
       method: "POST",
       headers: {
@@ -755,8 +843,7 @@ app.post("/api/check-document", heavyLimit, async (req, res) => {
 // Выдать доступ клиенту после оплаты. Только для владельца: нужен STATS_KEY.
 app.post("/api/portal/create", async (req, res) => {
   try {
-    const key = process.env.STATS_KEY;
-    if (!key || req.body.key !== key) return res.status(403).json({ ok: false, error: "forbidden" });
+    if (!adminAllowed(req, (req.body || {}).key)) return res.status(403).json({ ok: false, error: "forbidden" });
     const created = createPortalClient(req.body || {});
     if (!created.ok) {
       const status = created.error === "name" ? 400 : 500;
@@ -827,30 +914,44 @@ function portalPayload(c) {
   };
 }
 
-function readPortal(req, res, code, surname) {
-  const c = readClient(code);
-  const deny = () => {
-    noteLoginFail(req);
-    return res.status(404).json({ ok: false, error: "Не нашли бронь. Проверь фамилию и код." });
-  };
-  if (loginBlocked(req)) {
-    return res.status(429).json({ ok: false, error: "Слишком много попыток входа. Попробуй через 15 минут." });
-  }
-  if (!c) return deny();
-  if (normSurname(surname) !== normSurname(c.surname)) return deny();
+/* One door for every cabinet address (security pass, 27 Nov).
 
-  res.json(portalPayload(c));
+   Before, only the login counted wrong attempts. Saving a step, a document,
+   the settings, the Telegram link and deletion checked the code and the
+   surname themselves, did not count failures, and answered 404 for an
+   unknown code but 403 for a wrong surname. That told a stranger which
+   codes exist, and let them try surnames against a found code without end.
+
+   Now: the same answer whether the code or the surname is wrong, every
+   failure counts toward the same lock, and a locked address gets 429 before
+   the cabinet is even read. Returns the cabinet or null (answer already sent). */
+const PORTAL_DENIED = "Не нашли бронь. Проверь фамилию и код.";
+function portalAuth(req, res, rawCode, surname) {
+  if (loginBlocked(req)) {
+    res.status(429).json({ ok: false, error: "Слишком много попыток входа. Попробуй через 15 минут." });
+    return null;
+  }
+  const code = String(rawCode || "").toUpperCase().slice(0, 12);
+  const c = readClient(code);
+  const expected = c ? normSurname(c.surname) : "";
+  const supplied = normSurname(surname);
+  // A cabinet saved without a surname (old records) opens as before, by an empty one.
+  const match = Boolean(c) && (expected ? safeEqual(supplied, expected) : supplied === "");
+  if (!match) {
+    noteLoginFail(req);
+    res.status(404).json({ ok: false, error: PORTAL_DENIED });
+    return null;
+  }
+  return c;
 }
 
+/* The old GET /api/portal/:code?surname= is gone: it put the code and the
+   surname into the address, and addresses are written to logs on the way.
+   The site has used POST /api/portal/lookup since it appeared. */
 app.post("/api/portal/lookup", portalLimit, (req, res) => {
   const body = req.body || {};
-  const code = String(body.code || "").toUpperCase().slice(0, 12);
-  readPortal(req, res, code, body.surname);
-});
-
-app.get("/api/portal/:code", portalLimit, (req, res) => {
-  const code = String(req.params.code || "").toUpperCase().slice(0, 12);
-  readPortal(req, res, code, req.query.surname);
+  const c = portalAuth(req, res, body.code, body.surname);
+  if (c) res.json(portalPayload(c));
 });
 
 /* «Не помню код» — подробности и правила в portal-recovery.js.
@@ -897,12 +998,9 @@ const PROFILE_VALUES = {
 // Профиль и развилка 12 лет закрываются автоматически — пользователь не ставит
 // галочку там, где система сама знает состояние.
 app.post("/api/portal/:code/profile", portalLimit, (req, res) => {
+  const c = portalAuth(req, res, req.params.code, req.body && req.body.surname);
+  if (!c) return;
   const code = String(req.params.code || "").toUpperCase().slice(0, 12);
-  const c = readClient(code);
-  if (!c) return res.status(404).json({ ok: false, error: "Не нашли бронь" });
-  if (normSurname(req.body && req.body.surname) !== normSurname(c.surname)) {
-    return res.status(403).json({ ok: false, error: "Нет доступа" });
-  }
 
   const body = req.body || {};
   const p = c.profile = c.profile || {};
@@ -961,16 +1059,20 @@ app.post("/api/portal/:code/profile", portalLimit, (req, res) => {
 });
 
 // Отметить задачу выполненной или снять отметку
+const RESERVED_KEYS = new Set(["__proto__", "constructor", "prototype"]);
+const MAX_TASK_KEYS = 200;
 app.post("/api/portal/:code/task", portalLimit, (req, res) => {
+  const c = portalAuth(req, res, req.params.code, req.body && req.body.surname);
+  if (!c) return;
   const code = String(req.params.code || "").toUpperCase().slice(0, 12);
-  const c = readClient(code);
-  if (!c) return res.status(404).json({ ok: false, error: "Не нашли бронь" });
-  if (normSurname(req.body && req.body.surname) !== normSurname(c.surname)) {
-    return res.status(403).json({ ok: false, error: "Нет доступа" });
-  }
 
   const { task, value } = req.body || {};
-  if (typeof task !== "string" || !/^[a-zA-Z0-9_]{2,30}$/.test(task)) {
+  if (typeof task !== "string" || !/^[a-zA-Z0-9_]{2,30}$/.test(task) || RESERVED_KEYS.has(task)) {
+    return res.status(400).json({ ok: false, error: "Некорректная задача" });
+  }
+  c.done = c.done || {};
+  // The plan has a few dozen steps; marks beyond that are not the plan.
+  if (value && !c.done[task] && Object.keys(c.done).length >= MAX_TASK_KEYS) {
     return res.status(400).json({ ok: false, error: "Некорректная задача" });
   }
   if (task === "profile" || task === "path12") {
@@ -994,14 +1096,14 @@ app.post("/api/portal/:code/task", portalLimit, (req, res) => {
    Сохраняем ограниченный текстовый отчёт с основаниями и действиями.
    Исходные файлы, изображения/base64 и произвольные поля не сохраняются. */
 app.post("/api/portal/:code/doc", portalLimit, (req, res) => {
+  const c = portalAuth(req, res, req.params.code, req.body && req.body.surname);
+  if (!c) return;
   const code = String(req.params.code || "").toUpperCase().slice(0, 12);
-  const c = readClient(code);
-  if (!c) return res.status(404).json({ ok: false, error: "Не нашли бронь" });
-  if (normSurname(req.body && req.body.surname) !== normSurname(c.surname)) {
-    return res.status(403).json({ ok: false, error: "Нет доступа" });
-  }
   const { task, result, fileName } = req.body || {};
-  if (typeof task !== "string" || !/^[a-zA-Z0-9_]{2,30}$/.test(task) || ["__proto__", "constructor", "prototype"].includes(task)) {
+  if (typeof task !== "string" || !/^[a-zA-Z0-9_]{2,30}$/.test(task) || RESERVED_KEYS.has(task)) {
+    return res.status(400).json({ ok: false, error: "Некорректная задача" });
+  }
+  if (!(c.docs && c.docs[task]) && Object.keys(c.docs || {}).length >= MAX_TASK_KEYS) {
     return res.status(400).json({ ok: false, error: "Некорректная задача" });
   }
   const storedResult = sanitizePortalDocumentResult(result);
@@ -1045,12 +1147,9 @@ app.post("/api/portal/:code/doc", portalLimit, (req, res) => {
 /* Удаление данных по запросу. В политике конфиденциальности мы это обещаем,
    значит должен быть работающий способ, а не переписка вручную. */
 app.post("/api/portal/:code/delete", portalLimit, (req, res) => {
+  const c = portalAuth(req, res, req.params.code, req.body && req.body.surname);
+  if (!c) return;
   const code = String(req.params.code || "").toUpperCase().slice(0, 12);
-  const c = readClient(code);
-  if (!c) return res.status(404).json({ ok: false, error: "Не нашли бронь" });
-  if (normSurname(req.body && req.body.surname) !== normSurname(c.surname)) {
-    return res.status(403).json({ ok: false, error: "Нет доступа" });
-  }
   if (req.body.confirm !== "УДАЛИТЬ") {
     return res.status(400).json({ ok: false, error: "Нужно подтверждение" });
   }
@@ -1072,16 +1171,14 @@ app.post("/api/portal/:code/delete", portalLimit, (req, res) => {
 
 // Клиент управляет напоминаниями из кабинета
 app.post("/api/portal/:code/notify", portalLimit, (req, res) => {
+  const c = portalAuth(req, res, req.params.code, req.body && req.body.surname);
+  if (!c) return;
   const code = String(req.params.code || "").toUpperCase().slice(0, 12);
-  const c = readClient(code);
-  if (!c) return res.status(404).json({ ok: false, error: "Не нашли бронь" });
-  if (normSurname(req.body && req.body.surname) !== normSurname(c.surname)) {
-    return res.status(403).json({ ok: false, error: "Нет доступа" });
-  }
   const { email, notifyEmail, notifyTelegram } = req.body || {};
   if (typeof email === "string") {
-    if (email && !/.+@.+\..+/.test(email)) return res.status(400).json({ ok: false, error: "Проверь адрес почты" });
-    c.email = email.trim().slice(0, 80);
+    // One address, nothing that a mail server could read as a second recipient.
+    if (email.trim() && !validEmail(email.trim())) return res.status(400).json({ ok: false, error: "Проверь адрес почты" });
+    c.email = email.trim();
   }
   c.notify = c.notify || {};
   if (typeof notifyEmail === "boolean") c.notify.email = notifyEmail;
@@ -1101,12 +1198,9 @@ app.post("/api/portal/:code/notify", portalLimit, (req, res) => {
    Кабинет выдаёт случайный токен на 15 минут; на диске хранится только
    SHA-256 хеш. После успешного /start запись удаляется и повторно не работает. */
 app.post("/api/portal/:code/telegram-link", portalLimit, (req, res) => {
+  const c = portalAuth(req, res, req.params.code, req.body && req.body.surname);
+  if (!c) return;
   const code = String(req.params.code || "").toUpperCase().slice(0, 12);
-  const c = readClient(code);
-  if (!c) return res.status(404).json({ ok: false, error: "Не нашли бронь" });
-  if (normSurname(req.body && req.body.surname) !== normSurname(c.surname)) {
-    return res.status(403).json({ ok: false, error: "Нет доступа" });
-  }
 
   const botName = String(process.env.TG_BOT_NAME || "").replace(/^@/, "").trim();
   if (!/^[A-Za-z][A-Za-z0-9_]{4,31}$/.test(botName)) {
@@ -1157,8 +1251,11 @@ function tgChatLinked(chatId) {
 app.post("/api/tg/webhook", async (req, res) => {
   res.json({ ok: true });                       // отвечаем сразу, Telegram не ждёт
   try {
-    const secret = process.env.TG_WEBHOOK_SECRET;
-    if (secret && req.headers["x-telegram-bot-api-secret-token"] !== secret) return;
+    /* Without the secret nothing is accepted. Before, a server started
+       without TG_WEBHOOK_SECRET took any request for a message from Telegram:
+       a stranger could switch off someone's reminders with a forged /stop. */
+    const secret = String(process.env.TG_WEBHOOK_SECRET || "");
+    if (!safeEqual(String((req.headers || {})["x-telegram-bot-api-secret-token"] || ""), secret)) return;
 
     const msg = req.body && req.body.message;
     if (!msg || !msg.chat || !msg.text) return;
@@ -1357,8 +1454,7 @@ if (process.env.REMINDERS !== "off") {
 
 // Existing authenticated manual endpoint; uses the same single-flight runner.
 app.get("/api/reminders/run", async (req, res) => {
-  const key = process.env.STATS_KEY;
-  if (!key || req.query.key !== key) return res.status(403).json({ ok: false, error: "forbidden" });
+  if (!adminAllowed(req, (req.query || {}).key)) return res.status(403).json({ ok: false, error: "forbidden" });
   try {
     const result = await runReminders();
     res.json({ ok: true, ...result });
@@ -1369,17 +1465,23 @@ app.get("/api/reminders/run", async (req, res) => {
 
 // --- Аналитика: приём событий ---
 const EVENT_RE = /^[a-z0-9_]{2,40}$/;
+// The site sends «w-<time>-<random>»; a tab or a line break here would forge log lines.
+const DEVICE_RE = /^[A-Za-z0-9_.:-]{1,40}$/;
+/* Logs share the volume with the cabinets. Each keeps at most two files of
+   this size, so a flood of events cannot fill the volume and stop saves. */
+const eventsLog = createCappedLog(fs, EVENTS_LOG, 25 * 1024 * 1024);
+const leadsLog = createCappedLog(fs, LEADS_LOG, 5 * 1024 * 1024);
+const ordersLog = createCappedLog(fs, ORDERS_LOG, 5 * 1024 * 1024);
 app.post("/api/event", eventLimit, async (req, res) => {
   try {
     const { event, deviceId, props } = req.body || {};
     if (typeof event !== "string" || !EVENT_RE.test(event) ||
-        typeof deviceId !== "string" || deviceId.length > 40) {
+        typeof deviceId !== "string" || !DEVICE_RE.test(deviceId)) {
       return res.status(400).json({ ok: false });
     }
     const propsStr = props && typeof props === "object"
       ? JSON.stringify(props).slice(0, 200) : "{}";
-    const line = `${Date.now()}\t${event}\t${deviceId.slice(0, 40)}\t${propsStr}`;
-    fs.appendFile(EVENTS_LOG, line + "\n", () => {});
+    eventsLog.append(`${Date.now()}\t${event}\t${deviceId}\t${propsStr}`);
     res.json({ ok: true });
   } catch {
     res.status(500).json({ ok: false });
@@ -1389,10 +1491,12 @@ app.post("/api/event", eventLimit, async (req, res) => {
 // --- Сводка воронки: GET /api/stats?key=<STATS_KEY из env> ---
 const FUNNEL = ["app_open", "onboarding_done", "chat_message_sent", "tab_price", "buy_open", "order_submitted"];
 app.get("/api/stats", (req, res) => {
-  const key = process.env.STATS_KEY;
-  if (!key || req.query.key !== key) return res.status(403).json({ error: "forbidden" });
-  fs.readFile(EVENTS_LOG, "utf8", (err, data) => {
-    if (err) return res.json({ funnel: [], events: {} });
+  if (!adminAllowed(req, (req.query || {}).key)) return res.status(403).json({ error: "forbidden" });
+  fs.readFile(EVENTS_LOG, "utf8", (err, current) => {
+    let older = "";
+    try { older = fs.readFileSync(eventsLog.older, "utf8"); } catch { /* журнал ещё не переносился */ }
+    const data = older + (err ? "" : current);
+    if (!data) return res.json({ funnel: [], events: {} });
     const totals = {}, uniques = {};
     for (const line of data.split("\n")) {
       if (!line) continue;
@@ -1423,12 +1527,13 @@ app.get("/api/stats", (req, res) => {
 app.post("/api/lead", orderLimit, async (req, res) => {
   try {
     const { education, goal, budget, phone } = req.body || {};
-    const clean = (v) => (typeof v === "string" ? v.slice(0, 40) : "");
+    const clean = (v) => plainText(v, 40);
     const line = `${new Date().toISOString()} | LEAD | ${clean(education)} | ${clean(goal)} | ${clean(budget)} | ${clean(phone) || "-"}`;
-    console.log(line);
-    fs.appendFile(LEADS_LOG, line + "\n", () => {});
+    console.log("LEAD");   // the phone number stays out of the hosting log
+    leadsLog.append(line);
     const token = process.env.TG_BOT_TOKEN, chat = process.env.TG_CHAT_ID;
-    if (token && chat && clean(phone)) {
+    // The owner is messaged only about something that looks like a phone number.
+    if (token && chat && /^[+0-9() -]{7,20}$/.test(clean(phone))) {
       fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -1531,9 +1636,7 @@ app.post("/api/order", orderLimit, async (req, res) => {
     order.fulfillment = offer.fulfillment;
     order.provider = "manual";
     if (!orderStore.write(order)) return res.status(500).json({ ok: false, error: "Не удалось сохранить заказ." });
-    fs.appendFile(ORDERS_LOG,
-      [order.createdAt, order.id, order.product, order.price, order.status, order.provider].join("\t") + "\n",
-      () => {});
+    ordersLog.append([order.createdAt, order.id, order.product, order.price, order.status, order.provider].join("\t"));
     console.log("ORDER CREATED:", order.id);
     res.json({ ok: true, orderId: order.id });
   } catch {
@@ -1588,9 +1691,7 @@ app.post("/api/stripe/checkout", orderLimit, async (req, res) => {
     if (!orderStore.write(order)) {
       return res.status(500).json({ ok: false, error: "Сессия оплаты создана, но заказ не сохранился. Не оплачивай и попробуй ещё раз." });
     }
-    fs.appendFile(ORDERS_LOG,
-      [order.createdAt, order.id, order.product, order.price, order.status, order.provider].join("\t") + "\n",
-      () => {});
+    ordersLog.append([order.createdAt, order.id, order.product, order.price, order.status, order.provider].join("\t"));
     console.log("STRIPE CHECKOUT CREATED:", order.id);
     res.json({ ok: true, url: session.url, orderId: order.id, orderToken: access.token });
   } catch {
@@ -1601,7 +1702,7 @@ app.post("/api/stripe/checkout", orderLimit, async (req, res) => {
 
 // Browser polling after Stripe redirects back. Credentials are returned only
 // to the browser holding the random token created before checkout.
-app.post("/api/order/status", orderLimit, (req, res) => {
+app.post("/api/order/status", orderStatusLimit, (req, res) => {
   const { orderId, orderToken } = req.body || {};
   const order = orderStore.read(String(orderId || ""));
   if (!order || !orderTokenMatches(order, orderToken)) {
@@ -1685,18 +1786,8 @@ app.post("/api/stripe/webhook", async (req, res) => {
   }
 });
 
-function safeAdminKey(value) {
-  const key = String(process.env.STATS_KEY || "");
-  const supplied = String(value || "");
-  if (!key || !supplied) return false;
-  const a = Buffer.from(key), b = Buffer.from(supplied);
-  return a.length === b.length && crypto.timingSafeEqual(a, b);
-}
-
 function adminAuth(req, res, next) {
-  const auth = String(req.headers.authorization || "");
-  const token = auth.startsWith("Bearer ") ? auth.slice(7) : "";
-  if (!safeAdminKey(token)) return res.status(403).json({ ok: false, error: "forbidden" });
+  if (!adminAllowed(req)) return res.status(403).json({ ok: false, error: "forbidden" });
   next();
 }
 
@@ -1831,6 +1922,35 @@ if (process.env.DEMO_PORTAL === "on") {
   }
 }
 
+/* Anything that is not a route answers with JSON, and an error inside a
+   handler answers with one line instead of the framework's page: outside
+   production mode that page prints the stack and the file paths. */
+app.use((_req, res) => res.status(404).json({ ok: false, error: "Не найдено." }));
+app.use((err, _req, res, next) => {
+  console.error("unhandled route error:", (err && err.name) || "unknown");
+  if (res.headersSent) return next(err);
+  res.status(500).json({ ok: false, error: "Внутренняя ошибка сервера." });
+});
+/* A rejected promise in a handler must not stop the process: one crafted
+   request would otherwise restart the server for everyone. */
+if (typeof process.on === "function") {
+  process.on("unhandledRejection", (reason) => {
+    console.error("unhandled rejection:", (reason && reason.name) || "unknown");
+  });
+}
+
+/* Settings that leave a door open. The server keeps working without them, so
+   the owner hears about it in Telegram at start instead of from the logs. */
+function weakSettings(env) {
+  const weak = [];
+  if (!env.DATA_KEY) weak.push("DATA_KEY не задан: данные кабинетов лежат на диске без шифрования.");
+  if (String(env.STATS_KEY || "").length < 24) weak.push("STATS_KEY короче 24 символов: ключ владельца можно подобрать. Поставь длинную случайную строку.");
+  if (env.TG_BOT_TOKEN && !env.TG_WEBHOOK_SECRET) weak.push("TG_WEBHOOK_SECRET не задан: бот не принимает сообщения, пока секрета нет.");
+  if (!String(env.ALLOWED_ORIGINS || "").trim()) weak.push("ALLOWED_ORIGINS пуст: к серверу может обращаться страница любого сайта.");
+  if (env.STRIPE_SECRET_KEY && !env.STRIPE_WEBHOOK_SECRET) weak.push("STRIPE_WEBHOOK_SECRET не задан: оплата не подтвердится.");
+  return weak;
+}
+
 const PORT = process.env.PORT || 3000;
 /* Проверка настроек при старте: лучше увидеть предупреждение в логах,
    чем обнаружить неработающую функцию через неделю. */
@@ -1879,4 +1999,6 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`IITALY proxy up on :${PORT}`);
   void aiReadiness.check();
+  const weak = weakSettings(process.env);
+  if (weak.length) ownerAlert("⚠️ IITALY, настройки сервера:\n• " + weak.join("\n• "));
 });
