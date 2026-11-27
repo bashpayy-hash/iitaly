@@ -57,7 +57,8 @@ function createServerHarness(t, { enabled = false, apiKey = '', workspaceId = ''
       require(name) {
         if (name === 'express') return express;
         if (name === 'fs') return { ...fs, writeFileSync(file, ...args) {
-          if (h.failClientWrite && file === path.join(dataDir, 'clients/TEST-001.json')) throw new Error('synthetic write rejection');
+          // Cabinets are written to a temporary file next to the target, then renamed.
+          if (h.failClientWrite && String(file).startsWith(path.join(dataDir, 'clients/TEST-001.json'))) throw new Error('synthetic write rejection');
           return fs.writeFileSync(file, ...args);
         }, renameSync(from, to) {
           if (h.failRename) throw new Error('synthetic disk failure');
@@ -74,6 +75,7 @@ function createServerHarness(t, { enabled = false, apiKey = '', workspaceId = ''
         if (name === './telegram-linking') return require('../telegram-linking');
         if (name === './order-store') return require('../order-store');
         if (name === './portal-recovery') return require('../portal-recovery');
+        if (name === './request-guard') return require('../request-guard');
         if (name === './stripe-checkout') {
           const stripe = require('../stripe-checkout');
           return { ...stripe, createCheckoutSession: options => stripe.createCheckoutSession({ ...options, fetchImpl: async (...args) => {
@@ -501,7 +503,7 @@ test('report writes reject invalid objects and special keys; auth and rejected w
   c.done.uniApply = '2026-01-01T00:00:00Z';
   assert(h.server.writeClient('TEST-001', c));
   const submit = (body) => h.invoke('POST', '/api/portal/:code/doc', { params: { code: 'TEST-001' }, body });
-  assert.equal((await submit({ surname: 'Wrong', task: 'uniApply', result: { verdict: 'error' } })).statusCode, 403);
+  assert.equal((await submit({ surname: 'Wrong', task: 'uniApply', result: { verdict: 'error' } })).statusCode, 404);
   assert.equal((await submit({ surname: 'Пример', task: 'uniApply', result: [] })).statusCode, 400);
   for (const task of ['__proto__', 'constructor', 'prototype']) {
     assert.equal((await submit({ surname: 'Пример', task, result: { verdict: 'ok' } })).statusCode, 400);
@@ -535,7 +537,7 @@ test('profile shortlist is authenticated, encrypted and restored after server re
 test('profile shortlist rejects unauthorized, malformed and failed writes without losing the saved choice', async t => {
   const h = createServerHarness(t);
   const seed = h.server.readClient('TEST-001'); seed.profile.universityIds = ['bocconi']; h.server.writeClient('TEST-001', seed);
-  for (const [surname, universityIds, expected] of [['Другой', ['unipd'], 403], ['Пример', ['../secrets'], 400], ['Пример', 'bocconi', 400], ['Пример', Array(44).fill('bocconi'), 400]]) {
+  for (const [surname, universityIds, expected] of [['Другой', ['unipd'], 404], ['Пример', ['../secrets'], 400], ['Пример', 'bocconi', 400], ['Пример', Array(44).fill('bocconi'), 400]]) {
     const response = await h.invoke('POST', '/api/portal/:code/profile', { params: { code: 'TEST-001' }, body: { surname, universityIds } });
     assert.equal(response.statusCode, expected);
     assert.deepEqual(Array.from(h.server.readClient('TEST-001').profile.universityIds), ['bocconi']);
@@ -613,4 +615,116 @@ test('purchase email is optional, validated, kept on the order and handed to the
   assert.equal(h.email.length, 1);
   assert.equal(h.email[0].to, 'buyer@example.invalid');
   assert.match(h.email[0].text, new RegExp('Код: ' + confirm.payload.code));
+});
+
+/* ---------- Security pass, 27 Nov 2026 ---------- */
+
+test('cabinet door: a wrong surname and an unknown code get the same answer on every cabinet address', async t => {
+  const h = createServerHarness(t);
+  const calls = [
+    ['/api/portal/lookup', (code, surname) => ({ body: { code, surname } })],
+    ...['profile', 'task', 'doc', 'notify', 'telegram-link', 'delete'].map(name => ['/api/portal/:code/' + name,
+      (code, surname) => ({ params: { code }, body: { surname, task: 'uniApply', value: true, result: { verdict: 'ok' }, confirm: 'УДАЛИТЬ' } })]),
+  ];
+  for (const [index, [route, build]] of calls.entries()) {
+    // Each address is tried from its own caller, so the lock from the next test stays out of this one.
+    const headers = { 'x-nf-client-connection-ip': '198.51.100.' + (index + 1) };
+    const wrongSurname = await h.invoke('POST', route, { ...build('TEST-001', 'Чужой'), headers });
+    const unknownCode = await h.invoke('POST', route, { ...build('NOPE-0000', 'Пример'), headers });
+    assert.equal(wrongSurname.statusCode, 404, route);
+    assert.equal(JSON.stringify(wrongSurname.payload), JSON.stringify({ ok: false, error: 'Не нашли бронь. Проверь фамилию и код.' }), route);
+    assert.equal(JSON.stringify([unknownCode.statusCode, unknownCode.payload]), JSON.stringify([wrongSurname.statusCode, wrongSurname.payload]),
+      route + ' must not reveal that the code exists');
+  }
+  const untouched = h.server.readClient('TEST-001');
+  assert(untouched && !untouched.done.uniApply, 'no failed attempt changed or deleted the cabinet');
+  assert(!/app\.get\("\/api\/portal\/:code"/.test(originalServer), 'the address that carried code and surname in the URL is gone');
+});
+
+test('cabinet door: wrong attempts on any address lock that caller out, the owner of the cabinet elsewhere is not affected', async t => {
+  const h = createServerHarness(t);
+  const from = ip => ({ 'x-nf-client-connection-ip': ip, 'x-real-ip': '203.0.113.200' });
+  const task = (surname, ip) => h.invoke('POST', '/api/portal/:code/task', { params: { code: 'TEST-001' },
+    body: { surname, task: 'uniApply', value: true }, headers: from(ip) });
+  for (let i = 0; i < 12; i++) assert.equal((await task('Попытка' + i, '198.51.100.9')).statusCode, 404);
+  const locked = await task('Пример', '198.51.100.9');
+  assert.equal(locked.statusCode, 429, 'even the right surname is refused while the caller is locked');
+  assert(!h.server.readClient('TEST-001').done.uniApply);
+  const login = await h.invoke('POST', '/api/portal/lookup', { body: { code: 'TEST-001', surname: 'Пример' }, headers: from('198.51.100.9') });
+  assert.equal(login.statusCode, 429, 'the lock is shared by the login and the save addresses');
+  assert.equal((await task('Пример', '198.51.100.77')).payload.ok, true, 'another visitor through the same node works');
+});
+
+test('Telegram webhook accepts nothing without the secret, set or not', async t => {
+  for (const env of [{ TG_WEBHOOK_SECRET: '' }, {}]) {
+    const h = createServerHarness(t, { env });
+    for (const headers of [{}, { 'x-telegram-bot-api-secret-token': '' }, { 'x-telegram-bot-api-secret-token': 'guess' }]) {
+      await h.invoke('POST', '/api/tg/webhook', { headers, body: { message: { chat: { id: 101, type: 'private' }, text: '/stop' } } });
+    }
+    assert.equal(h.server.readClient('TEST-001').tgChatId, 101, 'a forged /stop does not disconnect the chat');
+    assert.equal(h.deliveries.length, 0, 'and the bot does not answer it');
+  }
+});
+
+test('AI spending: an oversized dialogue is refused before the provider, and the shared ceiling stops calls and tells the owner once', async t => {
+  const h = createServerHarness(t, { apiKey: 'synthetic-key', env: { AI_CHAT_PER_HOUR: '2', AI_DOCS_PER_HOUR: '1' },
+    upstream: async url => ({ ok: true, status: 200, json: async () => url.includes('/models/') ? { type: 'model', id: 'test' }
+      : { content: [{ type: 'text', text: '{"verdict":"warn","summary":"Synthetic result"}' }] } }) });
+  const long = Array.from({ length: 9 }, () => ({ role: 'user', content: 'я'.repeat(7000) }));
+  const tooLong = await h.invoke('POST', '/api/chat', { body: { messages: long } });
+  assert.equal(tooLong.statusCode, 400); assert.match(tooLong.payload.reply, /слишком длинным/);
+  assert.equal(h.aiRequests.filter(r => r.url.endsWith('/v1/messages')).length, 0);
+
+  const ask = () => h.invoke('POST', '/api/chat', { body: { messages: [{ role: 'user', content: 'Synthetic check' }] } });
+  assert.deepEqual([(await ask()).statusCode, (await ask()).statusCode], [200, 200]);
+  const third = await ask(), fourth = await ask();
+  assert.equal(third.statusCode, 503); assert.equal(third.payload.code, 'AI_BUSY'); assert.equal(fourth.statusCode, 503);
+  assert.equal(h.aiRequests.filter(r => r.url.endsWith('/v1/messages')).length, 2, 'refused calls never reach the provider');
+  const check = () => h.invoke('POST', '/api/check-document', { body: { text: 'Synthetic document without any personal data.' } });
+  assert.equal((await check()).statusCode, 200); assert.equal((await check()).statusCode, 503);
+  const alerts = h.deliveries.filter(d => d.chat_id === '999');
+  assert.equal(alerts.length, 2, 'one message per ceiling, not one per refused call');
+  assert.match(alerts[0].text, /предел вопросов помощнику за час \(2\)/); assert.match(alerts[0].text, /AI_CHAT_PER_HOUR/);
+  assert.match(alerts[1].text, /предел проверок документов за час \(1\)/);
+});
+
+test('owner key: accepted in the Authorization header, compared safely, and guessing locks the caller', async t => {
+  const h = createServerHarness(t);
+  const stats = (headers, query = {}) => h.invoke('GET', '/api/stats', { headers: { 'x-real-ip': '198.51.100.50', ...headers }, query });
+  assert.equal((await stats({ authorization: 'Bearer synthetic-test-admin-key' })).statusCode, 200);
+  assert.equal((await stats({}, { key: 'synthetic-test-admin-key' })).statusCode, 200, 'the old ?key= form still works');
+  for (let i = 0; i < 8; i++) assert.equal((await stats({ authorization: 'Bearer guess-' + i })).statusCode, 403);
+  assert.equal((await stats({ authorization: 'Bearer synthetic-test-admin-key' })).statusCode, 403, 'the right key is refused from a locked address');
+  const elsewhere = await h.invoke('GET', '/api/stats', { headers: { 'x-real-ip': '198.51.100.51', authorization: 'Bearer synthetic-test-admin-key' } });
+  assert.equal(elsewhere.statusCode, 200);
+  const create = await h.invoke('POST', '/api/portal/create', { headers: { 'x-real-ip': '198.51.100.52' },
+    body: { key: 'synthetic-test-admin-key', name: 'Новый', surname: 'Клиент', email: 'a@b.kz, evil@x.y' } });
+  assert.equal(create.statusCode, 200);
+  assert.match(create.payload.code, /^[ACDEFHJKLMNPRTUVWXY3479]{4}-[ACDEFHJKLMNPRTUVWXY3479]{4}$/);
+  assert.equal(h.server.readClient(create.payload.code).email, '', 'two addresses in one field are not stored as an email');
+  assert(!/Math\.random/.test(originalServer), 'nothing on the server relies on a predictable generator');
+});
+
+test('cabinet settings and step marks: one clean email, no reserved or endless keys', async t => {
+  const h = createServerHarness(t);
+  const post = (name, body) => h.invoke('POST', '/api/portal/:code/' + name, { params: { code: 'TEST-001' }, body: { surname: 'Пример', ...body } });
+  assert.equal((await post('notify', { email: 'a@b.kz\nBcc: evil@x.y' })).statusCode, 400);
+  assert.equal((await post('notify', { email: 'a@b.kz, evil@x.y' })).statusCode, 400);
+  assert.equal((await post('notify', { email: ' new@example.kz ' })).payload.email, 'new@example.kz');
+  for (const task of ['__proto__', 'constructor', 'prototype']) assert.equal((await post('task', { task, value: true })).statusCode, 400);
+  const c = h.server.readClient('TEST-001');
+  for (let i = 0; i < 200; i++) c.done['junk' + i] = '2026-01-01T00:00:00Z';
+  assert(h.server.writeClient('TEST-001', c));
+  assert.equal((await post('task', { task: 'oneMore', value: true })).statusCode, 400, 'marks beyond any real plan are refused');
+  assert.equal((await post('task', { task: 'junk0', value: false })).payload.ok, true, 'existing marks can still be cleared');
+});
+
+test('a failed save keeps the previous cabinet and leaves no temporary file', async t => {
+  const h = createServerHarness(t);
+  const before = fs.readFileSync(path.join(h.dataDir, 'clients/TEST-001.json'), 'utf8');
+  h.failRename = true;
+  assert.equal(h.server.writeClient('TEST-001', { ...h.server.readClient('TEST-001'), name: 'Changed' }), false);
+  h.failRename = false;
+  assert.equal(fs.readFileSync(path.join(h.dataDir, 'clients/TEST-001.json'), 'utf8'), before);
+  assert.deepEqual(fs.readdirSync(path.join(h.dataDir, 'clients')), ['TEST-001.json']);
 });
