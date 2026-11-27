@@ -426,6 +426,24 @@ app.get("/health", (_req, res) => {
   });
 });
 
+/* What the server sees as the caller's address (security pass, 27 Nov).
+   The per-address limits did not trigger on the live site: 40 requests in a
+   row passed a limit of 10. This shows the caller only their own request
+   path — which forwarding headers arrive and which value the limiter uses —
+   so the limiter can be keyed on the right one. */
+app.get("/health/ip", (req, res) => {
+  res.set("Cache-Control", "no-store");
+  const list = String(req.headers["x-forwarded-for"] || "").split(",").map(v => v.trim()).filter(Boolean);
+  res.json({
+    ok: true,
+    limiterKey: clientIp(req),
+    forwardedFor: list.slice(0, 8),
+    realIp: req.headers["x-real-ip"] || null,
+    netlifyClientIp: req.headers["x-nf-client-connection-ip"] || null,
+    socket: req.socket && req.socket.remoteAddress || null,
+  });
+});
+
 // Separate readiness: invalid AI credentials must not restart payments/portal.
 app.get("/health/ai", async (_req, res) => {
   res.set("Cache-Control", "no-store");
